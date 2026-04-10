@@ -1,0 +1,24 @@
+# Built artifacts
+build/
+app/build/
+
+# Gradle
+.gradle/
+!gradle/wrapper/gradle-wrapper.properties
+
+# Kotlin compiler session files
+.kotlin/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local config
+local.properties
+
+# OS junk
+.DS_Store
+Thumbs.db
