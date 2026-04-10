@@ -77,13 +77,12 @@ fun SetupScreen(
                     val client = CompanionClient(baseUrl.trim(), token.trim())
                     status = try {
                         val h = client.health()
-                        "OK: ${h.status}"
+                        "OK: v${h.version} on ${h.bind} (up ${h.uptimeSeconds}s)"
                     } catch (t: Throwable) {
                         "Failed: ${t.message ?: t::class.simpleName}"
-                    } finally {
-                        client.close()
-                        busy = false
                     }
+                    client.close()
+                    busy = false
                 }
             },
             enabled = !busy && baseUrl.isNotBlank() && token.isNotBlank(),
