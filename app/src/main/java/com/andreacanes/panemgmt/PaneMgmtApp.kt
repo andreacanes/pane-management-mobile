@@ -1,6 +1,7 @@
 package com.andreacanes.panemgmt
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -28,8 +29,24 @@ fun PaneMgmtApp() {
     val authStore = remember { AuthStore(context.applicationContext) }
     val auth by authStore.configFlow.collectAsState(initial = null)
     val navController = rememberNavController()
+    val deepLinkPaneId by DeepLinkBus.paneIdFlow.collectAsState()
 
     val startDestination = if (auth == null) Routes.SETUP else Routes.GRID
+
+    // Drop into the pane detail screen when a notification deep-link fires.
+    // Requires auth to be present — otherwise the link is silently consumed
+    // (tap drops you on SETUP, acceptable edge case).
+    LaunchedEffect(deepLinkPaneId, auth) {
+        val paneId = deepLinkPaneId ?: return@LaunchedEffect
+        if (auth == null) {
+            DeepLinkBus.consume()
+            return@LaunchedEffect
+        }
+        navController.navigate(Routes.detail(paneId)) {
+            launchSingleTop = true
+        }
+        DeepLinkBus.consume()
+    }
 
     NavHost(navController = navController, startDestination = startDestination) {
         composable(Routes.SETUP) {

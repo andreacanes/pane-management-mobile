@@ -38,7 +38,10 @@ data class PaneDto(
     val state: PaneState,
     @SerialName("last_output_preview") val lastOutputPreview: List<String>,
     @SerialName("project_encoded_name") val projectEncodedName: String? = null,
+    @SerialName("project_display_name") val projectDisplayName: String? = null,
     @SerialName("claude_session_id") val claudeSessionId: String? = null,
+    /** "andrea" | "bravura" | null — detected from child process env. */
+    @SerialName("claude_account") val claudeAccount: String? = null,
     @SerialName("updated_at") val updatedAt: Long,
 )
 
@@ -58,6 +61,8 @@ data class ApprovalDto(
     @SerialName("tool_input") val toolInput: JsonElement? = null,
     @SerialName("created_at") val createdAt: Long,
     @SerialName("expires_at") val expiresAt: Long,
+    @SerialName("project_display_name") val projectDisplayName: String? = null,
+    @SerialName("claude_account") val claudeAccount: String? = null,
 )
 
 @Serializable
@@ -71,6 +76,11 @@ data class SendVoiceRequest(
     val transcript: String,
     val submit: Boolean = true,
     val locale: String? = null,
+)
+
+@Serializable
+data class SendKeyRequest(
+    val key: String,
 )
 
 @Serializable
@@ -88,6 +98,49 @@ data class HealthDto(
     val bind: String,
     @SerialName("uptime_s") val uptimeSeconds: Long,
 )
+
+@Serializable
+data class ProjectDto(
+    @SerialName("encoded_name") val encodedName: String,
+    @SerialName("display_name") val displayName: String,
+    @SerialName("actual_path")  val actualPath: String,
+    @SerialName("git_branch")   val gitBranch: String? = null,
+    @SerialName("session_count") val sessionCount: Int,
+    @SerialName("active_pane_count") val activePaneCount: Int,
+    val tier: String? = null,
+)
+
+@Serializable
+data class CreateWindowRequest(
+    @SerialName("session_name") val sessionName: String,
+    @SerialName("project_path") val projectPath: String,
+    @SerialName("project_display_name") val projectDisplayName: String,
+    val account: String,
+)
+
+@Serializable
+data class CreateWindowResponse(
+    @SerialName("window_index") val windowIndex: Int,
+    @SerialName("pane_id") val paneId: String,
+)
+
+/**
+ * Aggregate usage summary returned by `GET /api/v1/usage`. Mirrors the
+ * ad-hoc JSON object built in `companion/http.rs::usage_summary`.
+ */
+@Serializable
+data class UsageDto(
+    val projects: Int,
+    val sessions: Int,
+    @SerialName("input_tokens")       val inputTokens: Long,
+    @SerialName("output_tokens")      val outputTokens: Long,
+    @SerialName("cache_write_tokens") val cacheWriteTokens: Long,
+    @SerialName("cache_read_tokens")  val cacheReadTokens: Long,
+    @SerialName("total_cost_usd")     val totalCostUsd: Double,
+) {
+    val totalTokens: Long
+        get() = inputTokens + outputTokens + cacheWriteTokens + cacheReadTokens
+}
 
 /**
  * Tagged envelope for WebSocket events. The Rust side uses
@@ -116,6 +169,12 @@ sealed class EventDto {
     ) : EventDto()
 
     @Serializable
+    @SerialName("pane_updated")
+    data class PaneUpdated(
+        val pane: PaneDto,
+    ) : EventDto()
+
+    @Serializable
     @SerialName("pane_output_changed")
     data class PaneOutputChanged(
         @SerialName("pane_id") val paneId: String,
@@ -134,6 +193,18 @@ sealed class EventDto {
         val id: String,
         val decision: String,
         val at: Long,
+    ) : EventDto()
+
+    @Serializable
+    @SerialName("attention_needed")
+    data class AttentionNeeded(
+        @SerialName("pane_id") val paneId: String,
+        val title: String,
+        val message: String,
+        val at: Long,
+        val kind: String = "input",
+        @SerialName("project_display_name") val projectDisplayName: String? = null,
+        @SerialName("claude_account") val claudeAccount: String? = null,
     ) : EventDto()
 
     @Serializable

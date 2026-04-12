@@ -2,13 +2,18 @@ package com.andreacanes.panemgmt.data
 
 import com.andreacanes.panemgmt.data.models.ApprovalDto
 import com.andreacanes.panemgmt.data.models.CaptureDto
+import com.andreacanes.panemgmt.data.models.CreateWindowRequest
+import com.andreacanes.panemgmt.data.models.CreateWindowResponse
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.HealthDto
 import com.andreacanes.panemgmt.data.models.PaneDto
+import com.andreacanes.panemgmt.data.models.ProjectDto
 import com.andreacanes.panemgmt.data.models.ResolveApprovalRequest
 import com.andreacanes.panemgmt.data.models.SendInputRequest
+import com.andreacanes.panemgmt.data.models.SendKeyRequest
 import com.andreacanes.panemgmt.data.models.SendVoiceRequest
 import com.andreacanes.panemgmt.data.models.SessionDto
+import com.andreacanes.panemgmt.data.models.UsageDto
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
@@ -17,6 +22,7 @@ import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
@@ -86,7 +92,7 @@ class CompanionClient(
             if (session != null) parameter("session", session)
         }.body()
 
-    suspend fun capture(paneId: String, lines: Int = 200): CaptureDto =
+    suspend fun capture(paneId: String, lines: Int = 1000): CaptureDto =
         client.get("/api/v1/panes/$paneId/capture") {
             parameter("lines", lines)
         }.body()
@@ -105,6 +111,19 @@ class CompanionClient(
         }
     }
 
+    /**
+     * Send a single named key to a pane via tmux send-keys (no `-l`).
+     * Companion whitelists names like `S-Tab`, `Enter`, `Escape`,
+     * `Up`/`Down`/`Left`/`Right`. Used by the mode-cycle button to
+     * shift Claude between Normal / Auto-Accept / Plan / Bypass.
+     */
+    suspend fun sendKey(paneId: String, key: String) {
+        client.post("/api/v1/panes/$paneId/key") {
+            contentType(ContentType.Application.Json)
+            setBody(SendKeyRequest(key = key))
+        }
+    }
+
     suspend fun cancelPane(paneId: String) {
         client.post("/api/v1/panes/$paneId/cancel")
     }
@@ -112,11 +131,42 @@ class CompanionClient(
     suspend fun listApprovals(): List<ApprovalDto> =
         client.get("/api/v1/approvals").body()
 
+    /** Aggregate usage summary across all projects and sessions. */
+    suspend fun usage(): UsageDto =
+        client.get("/api/v1/usage").body()
+
     suspend fun resolveApproval(id: String, decision: String, reason: String? = null) {
         client.post("/api/v1/approvals/$id") {
             contentType(ContentType.Application.Json)
             setBody(ResolveApprovalRequest(decision = decision, reason = reason))
         }
+    }
+
+    /**
+     * Fetch every project the desktop knows about, sorted server-side
+     * by active-pane count then alphabetical. Used by the mobile
+     * CreateWindowSheet project picker.
+     */
+    suspend fun listProjects(): List<ProjectDto> =
+        client.get("/api/v1/projects").body()
+
+    /**
+     * Create a new tmux window rooted at `project_path` in `session_name`
+     * and launch `ncld`/`ncld2` inside it (Andrea / Bravura). Returns
+     * the new window index and the pane id the caller can deep-link to.
+     */
+    suspend fun createWindow(req: CreateWindowRequest): CreateWindowResponse =
+        client.post("/api/v1/windows") {
+            contentType(ContentType.Application.Json)
+            setBody(req)
+        }.body()
+
+    /**
+     * Kill a tmux window by session + index. Terminates every pane in
+     * the window. No body; returns 204 on success.
+     */
+    suspend fun killWindow(sessionName: String, windowIndex: Int) {
+        client.delete("/api/v1/windows/$sessionName/$windowIndex")
     }
 
     // ---- WebSocket --------------------------------------------------------
