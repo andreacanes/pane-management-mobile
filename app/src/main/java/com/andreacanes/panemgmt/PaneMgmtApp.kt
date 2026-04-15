@@ -34,15 +34,18 @@ fun PaneMgmtApp() {
     val startDestination = if (auth == null) Routes.SETUP else Routes.GRID
 
     // Drop into the pane detail screen when a notification deep-link fires.
-    // Requires auth to be present — otherwise the link is silently consumed
-    // (tap drops you on SETUP, acceptable edge case).
+    // We wait for auth to be non-null before consuming the pane ID — on a
+    // cold start the DataStore flow starts as null and the real config
+    // arrives a frame later. Consuming eagerly would discard the deep-link
+    // before we can navigate.
     LaunchedEffect(deepLinkPaneId, auth) {
         val paneId = deepLinkPaneId ?: return@LaunchedEffect
-        if (auth == null) {
-            DeepLinkBus.consume()
-            return@LaunchedEffect
-        }
+        if (auth == null) return@LaunchedEffect          // wait for auth, don't consume yet
         navController.navigate(Routes.detail(paneId)) {
+            // Pop any existing detail screen so navigating from one
+            // pane detail to another works (same route pattern with
+            // different args). The grid stays in the back stack.
+            popUpTo(Routes.GRID) { inclusive = false }
             launchSingleTop = true
         }
         DeepLinkBus.consume()
@@ -82,6 +85,9 @@ fun PaneMgmtApp() {
                 authStore = authStore,
                 paneId = paneId,
                 onBack = { navController.popBackStack() },
+                onNavigateToPane = { targetPaneId ->
+                    navController.navigate(Routes.detail(targetPaneId))
+                },
             )
         }
     }

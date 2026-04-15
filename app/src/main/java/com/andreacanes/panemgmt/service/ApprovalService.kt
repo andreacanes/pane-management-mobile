@@ -27,7 +27,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import com.andreacanes.panemgmt.ViewedPaneBus
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Foreground service that keeps a Ktor WebSocket subscription to the
@@ -76,6 +78,24 @@ class ApprovalService : Service() {
         // approvalId (uuid string) → notification id, so we can cancel when
         // the approval resolves from the desktop side.
         val openApprovals = mutableMapOf<String, Int>()
+        // paneId → attention notification id, so PaneStateChanged can cancel.
+        val openAttention = mutableMapOf<String, Int>()
+        // Maps paneId → list of approval UUIDs for that pane, so viewing a
+        // pane can cancel all its approval notifications at once.
+        val approvalsByPane = mutableMapOf<String, MutableList<String>>()
+
+        // Cancel notifications when the user views a pane in the app.
+        val viewedPaneJob = scope.launch {
+            ViewedPaneBus.events.collect { viewedPaneId ->
+                val nm = NotificationManagerCompat.from(applicationContext)
+                // Cancel attention notification for this pane
+                openAttention.remove(viewedPaneId)?.let { nm.cancel(it) }
+                // Cancel all approval notifications for this pane
+                approvalsByPane.remove(viewedPaneId)?.forEach { approvalId ->
+                    openApprovals.remove(approvalId)?.let { nm.cancel(it) }
+                }
+            }
+        }
 
         var backoff = 1_000L
         while (true) {
@@ -84,10 +104,13 @@ class ApprovalService : Service() {
                 client.events().collect { ev ->
                     when (ev) {
                         is EventDto.ApprovalCreated -> {
-                            val notifId = ev.approval.id.hashCode()
+                            val notifId = nextNotifId.getAndIncrement()
                             openApprovals[ev.approval.id] = notifId
+                            approvalsByPane.getOrPut(ev.approval.paneId) { mutableListOf() }
+                                .add(ev.approval.id)
                             val project = ev.approval.projectDisplayName
-                            val prefix = if (project != null) "[$project] " else ""
+                            val paneLabel = ev.approval.paneId.substringAfterLast(":")
+                            val prefix = if (project != null) "[$project:$paneLabel] " else "[${ev.approval.paneId}] "
                             postApprovalNotification(
                                 notifId = notifId,
                                 paneId = ev.approval.paneId,
@@ -96,29 +119,47 @@ class ApprovalService : Service() {
                             )
                         }
                         is EventDto.AttentionNeeded -> {
-                            val notifId = ("attn:${ev.paneId}").hashCode()
+                            // Reuse the same notifId for the same pane so a
+                            // second attention event for the same pane updates
+                            // the existing notification instead of stacking.
+                            val notifId = openAttention.getOrPut(ev.paneId) {
+                                nextNotifId.getAndIncrement()
+                            }
                             val channel = if (ev.kind == "input")
                                 NotificationChannels.ATTENTION_INPUT
                             else
                                 NotificationChannels.ATTENTION_INFO
+                            // Title already includes [project] from the Rust side;
+                            // append the pane window.index so you can tell panes apart.
+                            val paneLabel = ev.paneId.substringAfterLast(":")
+                            val enrichedTitle = if (ev.title.startsWith("["))
+                                ev.title.replaceFirst("] ", ":$paneLabel] ")
+                            else
+                                "[${ev.paneId}] ${ev.title}"
                             postAttentionNotification(
                                 notifId = notifId,
                                 paneId = ev.paneId,
-                                title = ev.title,
+                                title = enrichedTitle,
                                 body = ev.message,
                                 channel = channel,
                             )
                         }
                         is EventDto.ApprovalResolved -> {
-                            val notifId = openApprovals.remove(ev.id) ?: ev.id.hashCode()
-                            NotificationManagerCompat.from(applicationContext).cancel(notifId)
+                            val notifId = openApprovals.remove(ev.id)
+                            if (notifId != null) {
+                                NotificationManagerCompat.from(applicationContext).cancel(notifId)
+                            }
+                            // Clean up the pane→approval reverse index
+                            for (list in approvalsByPane.values) { list.remove(ev.id) }
                         }
                         is EventDto.PaneStateChanged -> {
                             // When a pane leaves Waiting, drop any lingering
                             // attention notification for it — we've resolved.
                             if (ev.old == PaneState.Waiting && ev.new != PaneState.Waiting) {
-                                val attnId = ("attn:${ev.paneId}").hashCode()
-                                NotificationManagerCompat.from(applicationContext).cancel(attnId)
+                                val attnId = openAttention.remove(ev.paneId)
+                                if (attnId != null) {
+                                    NotificationManagerCompat.from(applicationContext).cancel(attnId)
+                                }
                             }
                         }
                         is EventDto.Snapshot -> {
@@ -126,10 +167,13 @@ class ApprovalService : Service() {
                             // Don't re-notify for ones we already notified about.
                             ev.approvals.forEach { approval ->
                                 if (!openApprovals.containsKey(approval.id)) {
-                                    val notifId = approval.id.hashCode()
+                                    val notifId = nextNotifId.getAndIncrement()
                                     openApprovals[approval.id] = notifId
+                                    approvalsByPane.getOrPut(approval.paneId) { mutableListOf() }
+                                        .add(approval.id)
                                     val project = approval.projectDisplayName
-                                    val prefix = if (project != null) "[$project] " else ""
+                                    val paneLabel = approval.paneId.substringAfterLast(":")
+                                    val prefix = if (project != null) "[$project:$paneLabel] " else "[${approval.paneId}] "
                                     postApprovalNotification(
                                         notifId = notifId,
                                         paneId = approval.paneId,
@@ -260,6 +304,9 @@ class ApprovalService : Service() {
     companion object {
         private const val NOTIF_WATCHER_ID = 1001
         private const val REQ_OPEN_APP = 2001
+        /** Monotonic counter for notification IDs. Avoids hash collisions
+         *  from UUID.hashCode() and resets safely on service restart. */
+        private val nextNotifId = AtomicInteger(10_000)
 
         fun start(context: Context) {
             val intent = Intent(context, ApprovalService::class.java)

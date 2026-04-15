@@ -41,6 +41,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,16 +52,22 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
 import com.andreacanes.panemgmt.data.AuthStore
 import com.andreacanes.panemgmt.data.CompanionClient
+import com.andreacanes.panemgmt.data.models.AccountRateLimitDto
 import com.andreacanes.panemgmt.data.models.ApprovalDto
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.PaneDto
@@ -74,8 +82,14 @@ import kotlinx.coroutines.launch
 private enum class GridTab(val label: String) {
     Active("Active"),
     Waiting("Waiting"),
+    Stashed("Stashed"),
     All("All"),
 }
+
+/** A pane is "stashed" when it's neither active nor waiting and hasn't
+ *  been touched in over an hour — long-idle background sessions you've
+ *  forgotten about. */
+private const val STASHED_THRESHOLD_MS: Long = 60L * 60L * 1000L
 
 private enum class ClaudeAccount(val label: String, val color: Color) {
     Andrea("Andrea", Color(0xFF818CF8)),
@@ -165,9 +179,10 @@ fun PaneGridScreen(
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var wsConnected by remember { mutableStateOf(false) }
-    var activeTab by remember { mutableIntStateOf(GridTab.Active.ordinal) }
+    val pagerState = rememberPagerState(initialPage = GridTab.Active.ordinal) { GridTab.entries.size }
     var isRefreshing by remember { mutableStateOf(false) }
     var showCreateSheet by remember { mutableStateOf(false) }
+    var rateLimits by remember { mutableStateOf<List<AccountRateLimitDto>>(emptyList()) }
 
     // Grid refresh: panes + approvals only. Usage is intentionally NOT
     // awaited here — it scans every JSONL file on disk on the Rust side
@@ -193,6 +208,15 @@ fun PaneGridScreen(
         }
     }
 
+    suspend fun refreshRateLimitsOnce(cfg: com.andreacanes.panemgmt.data.AuthConfig) {
+        val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
+        try {
+            rateLimits = runCatching { client.rateLimits() }.getOrDefault(emptyList())
+        } finally {
+            client.close()
+        }
+    }
+
     // Auto-reconnecting WebSocket loop. The connection drops whenever the
     // companion exe restarts (full Tauri rebuild) or the host briefly loses
     // network. Without a retry the screen sticks on "Software caused
@@ -207,6 +231,7 @@ fun PaneGridScreen(
         // parallel. First load still gets it within ~1 s without
         // delaying the grid's first paint.
         launch { runCatching { refreshUsageOnce(cfg) } }
+        launch { runCatching { refreshRateLimitsOnce(cfg) } }
         while (true) {
             val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
             try {
@@ -252,6 +277,9 @@ fun PaneGridScreen(
                         is EventDto.ApprovalResolved -> {
                             approvals = approvals.filterNot { it.id == ev.id }
                         }
+                        is EventDto.PaneRemoved -> {
+                            panes = panes.filterNot { it.id == ev.paneId }
+                        }
                         else -> Unit
                     }
                 }
@@ -270,11 +298,43 @@ fun PaneGridScreen(
         }
     }
 
+    // Refresh rate limits every 60s in the background. The companion
+    // caches the Anthropic API response so this is cheap.
+    LaunchedEffect(config) {
+        val cfg = config ?: return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(60_000L)
+            runCatching { refreshRateLimitsOnce(cfg) }
+        }
+    }
+
     val approvalPaneIds = remember(approvals) { approvals.map { it.paneId }.toSet() }
     fun effectiveState(p: PaneDto): PaneState =
         if (approvalPaneIds.contains(p.id)) PaneState.Waiting else p.state
     fun isWaiting(p: PaneDto): Boolean =
         p.state == PaneState.Waiting || approvalPaneIds.contains(p.id)
+
+    // `nowMs` is refreshed every 60s so the Stashed filter (anything
+    // older than an hour) updates even when no pane events arrive.
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(60_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
+
+    /** "Last real activity" = JSONL mtime if Claude is/was bound to this
+     *  pane, otherwise the DTO's updated_at. lastActivityAt is null for
+     *  non-Claude panes and stale for ones where Claude has exited (the
+     *  poller clears claude_session_id on exit), so the fallback covers
+     *  those cases gracefully. */
+    fun lastActivity(p: PaneDto): Long = p.lastActivityAt ?: p.updatedAt
+
+    fun isStashed(p: PaneDto): Boolean =
+        p.state != PaneState.Running &&
+            !isWaiting(p) &&
+            (nowMs - lastActivity(p)) > STASHED_THRESHOLD_MS
 
     val activeCount = remember(panes, approvalPaneIds) {
         panes.count { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
@@ -282,56 +342,44 @@ fun PaneGridScreen(
     val waitingCount = remember(panes, approvalPaneIds) {
         panes.count { isWaiting(it) }
     }
+    val stashedCount = remember(panes, approvalPaneIds, nowMs) {
+        panes.count { isStashed(it) }
+    }
     val allCount = panes.size
 
-    val filteredPanes = remember(panes, approvalPaneIds, activeTab) {
-        when (GridTab.entries[activeTab]) {
-            GridTab.Active  -> panes.filter { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
-            GridTab.Waiting -> panes.filter { isWaiting(it) }
-            GridTab.All     -> panes
-        }
+    fun panesForTab(tab: GridTab): List<PaneDto> = when (tab) {
+        GridTab.Active  -> panes.filter { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
+        GridTab.Waiting -> panes.filter { isWaiting(it) }
+        GridTab.Stashed -> panes.filter { isStashed(it) }
+            .sortedBy { lastActivity(it) } // oldest first — most "stashed" at top
+        GridTab.All     -> panes
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Panes")
-                        Spacer(Modifier.width(10.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
                         ConnectionDot(
                             connected = wsConnected,
                             reconnecting = !wsConnected && (loading || error != null),
                         )
+                        rateLimits.forEach { rl ->
+                            RateLimitChip(rl)
+                        }
                     }
                 },
                 actions = {
+                    if (approvals.isNotEmpty()) {
+                        Badge(modifier = Modifier.padding(end = 4.dp)) {
+                            Text(approvals.size.toString())
+                        }
+                    }
                     IconButton(onClick = { showCreateSheet = true }) {
                         Icon(Icons.Default.Add, contentDescription = "New window")
-                    }
-                    BadgedBox(
-                        modifier = Modifier.padding(horizontal = 4.dp),
-                        badge = {
-                            if (approvals.isNotEmpty()) {
-                                Badge { Text(approvals.size.toString()) }
-                            }
-                        },
-                    ) {
-                        IconButton(onClick = {
-                            scope.launch {
-                                val cfg = config ?: return@launch
-                                isRefreshing = true
-                                runCatching { refreshOnce(cfg) }
-                                    .onFailure { error = it.message }
-                                isRefreshing = false
-                            }
-                            scope.launch {
-                                val cfg = config ?: return@launch
-                                runCatching { refreshUsageOnce(cfg) }
-                            }
-                        }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Refresh")
-                        }
                     }
                     IconButton(onClick = {
                         scope.launch {
@@ -351,16 +399,17 @@ fun PaneGridScreen(
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
-            TabRow(selectedTabIndex = activeTab) {
+            TabRow(selectedTabIndex = pagerState.currentPage) {
                 GridTab.entries.forEachIndexed { index, tab ->
                     val count = when (tab) {
                         GridTab.Active  -> activeCount
                         GridTab.Waiting -> waitingCount
+                        GridTab.Stashed -> stashedCount
                         GridTab.All     -> allCount
                     }
                     Tab(
-                        selected = activeTab == index,
-                        onClick = { activeTab = index },
+                        selected = pagerState.currentPage == index,
+                        onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
                         text = {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(tab.label)
@@ -390,38 +439,52 @@ fun PaneGridScreen(
                     contentAlignment = Alignment.Center,
                 ) { CircularProgressIndicator() }
             } else {
-                PullToRefreshBox(
-                    isRefreshing = isRefreshing,
-                    onRefresh = {
-                        scope.launch {
-                            val cfg = config ?: return@launch
-                            isRefreshing = true
-                            runCatching { refreshOnce(cfg) }
-                                .onFailure { error = it.message }
-                            isRefreshing = false
-                        }
-                        scope.launch {
-                            val cfg = config ?: return@launch
-                            runCatching { refreshUsageOnce(cfg) }
-                        }
-                    },
-                    state = rememberPullToRefreshState(),
+                HorizontalPager(
+                    state = pagerState,
                     modifier = Modifier.fillMaxSize(),
-                ) {
-                    if (filteredPanes.isEmpty()) {
-                        EmptyTabState(tab = GridTab.entries[activeTab])
-                    } else {
-                        LazyColumn(
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            items(filteredPanes, key = { it.id }) { pane ->
-                                PaneCard(
-                                    pane = pane,
-                                    effectiveState = effectiveState(pane),
-                                    hasApproval = approvalPaneIds.contains(pane.id),
-                                    onClick = { onOpenPane(pane.id) },
-                                )
+                ) { page ->
+                    val tab = GridTab.entries[page]
+                    // nowMs in the key so the Stashed tab re-filters when the
+                    // hour-old threshold sweeps over a previously fresh pane.
+                    val tabPanes = remember(panes, approvalPaneIds, page, nowMs) { panesForTab(tab) }
+
+                    PullToRefreshBox(
+                        isRefreshing = isRefreshing,
+                        onRefresh = {
+                            scope.launch {
+                                val cfg = config ?: return@launch
+                                isRefreshing = true
+                                runCatching { refreshOnce(cfg) }
+                                    .onFailure { error = it.message }
+                                isRefreshing = false
+                            }
+                            scope.launch {
+                                val cfg = config ?: return@launch
+                                runCatching { refreshUsageOnce(cfg) }
+                            }
+                            scope.launch {
+                                val cfg = config ?: return@launch
+                                runCatching { refreshRateLimitsOnce(cfg) }
+                            }
+                        },
+                        state = rememberPullToRefreshState(),
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        if (tabPanes.isEmpty()) {
+                            EmptyTabState(tab = tab)
+                        } else {
+                            LazyColumn(
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                items(tabPanes, key = { it.id }) { pane ->
+                                    PaneCard(
+                                        pane = pane,
+                                        effectiveState = effectiveState(pane),
+                                        hasApproval = approvalPaneIds.contains(pane.id),
+                                        onClick = { onOpenPane(pane.id) },
+                                    )
+                                }
                             }
                         }
                     }
@@ -455,6 +518,238 @@ private fun ConnectionDot(connected: Boolean, reconnecting: Boolean) {
             .clip(CircleShape)
             .background(color),
     )
+}
+
+/**
+ * Compact per-account rate limit chip for the toolbar. Shows both the
+ * 5h session and 7d weekly utilization stacked vertically with mini
+ * progress bars and countdowns. Account color from [ClaudeAccount].
+ */
+@Composable
+private fun RateLimitChip(rl: AccountRateLimitDto) {
+    val acctColor = when (rl.account) {
+        "bravura" -> ClaudeAccount.Bravura.color
+        else -> ClaudeAccount.Andrea.color
+    }
+    var showDetail by remember { mutableStateOf(false) }
+
+    Box {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(acctColor.copy(alpha = 0.10f))
+                .clickable { showDetail = true }
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            // Account initial
+            Text(
+                text = rl.label.take(1),
+                style = MaterialTheme.typography.labelSmall,
+                color = acctColor,
+                fontWeight = FontWeight.Bold,
+            )
+            // Two rows: 5h and 7d
+            Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                RateLimitRow("5h", rl.fiveHourPct, rl.fiveHourResetsAt, acctColor)
+                RateLimitRow("7d", rl.sevenDayPct, rl.sevenDayResetsAt, acctColor)
+            }
+        }
+
+        if (showDetail) {
+            RateLimitDetailPopup(rl, acctColor, onDismiss = { showDetail = false })
+        }
+    }
+}
+
+@Composable
+private fun RateLimitDetailPopup(
+    rl: AccountRateLimitDto,
+    acctColor: Color,
+    onDismiss: () -> Unit,
+) {
+    Popup(
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true),
+    ) {
+        Card(
+            modifier = Modifier
+                .width(220.dp)
+                .padding(top = 4.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // Header
+                Text(
+                    text = rl.label,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = acctColor,
+                    fontWeight = FontWeight.Bold,
+                )
+
+                // 5-hour window
+                RateLimitDetailSection(
+                    title = "5-hour session",
+                    pct = rl.fiveHourPct,
+                    totalMinutes = 300,  // 5h = 300 min
+                    resetsAt = rl.fiveHourResetsAt,
+                    color = acctColor,
+                )
+
+                // 7-day window
+                RateLimitDetailSection(
+                    title = "7-day weekly",
+                    pct = rl.sevenDayPct,
+                    totalMinutes = 10_080,  // 7d = 10,080 min
+                    resetsAt = rl.sevenDayResetsAt,
+                    color = acctColor,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RateLimitDetailSection(
+    title: String,
+    pct: Double,
+    totalMinutes: Int,
+    resetsAt: Long?,
+    color: Color,
+) {
+    val pctInt = pct.toInt().coerceIn(0, 100)
+    val usedMinutes = (pct / 100.0 * totalMinutes).toInt()
+    val remainingMinutes = (totalMinutes - usedMinutes).coerceAtLeast(0)
+    val countdown = fmtCountdown(resetsAt)
+
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        // Progress bar — 10 segments for finer granularity
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            val filledSegments = (pctInt + 9) / 10  // 10 segments, 10% each
+            repeat(10) { i ->
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(
+                            if (i < filledSegments) color
+                            else MaterialTheme.colorScheme.surfaceContainerHighest,
+                        ),
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "$pctInt% used",
+                style = MaterialTheme.typography.labelSmall,
+                color = color,
+                fontFamily = FontFamily.Monospace,
+            )
+            Text(
+                text = fmtMinutesRemaining(remainingMinutes),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+            )
+        }
+        if (countdown.isNotEmpty()) {
+            Text(
+                text = "resets in $countdown",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RateLimitRow(
+    label: String,
+    pct: Double,
+    resetsAt: Long?,
+    color: Color,
+) {
+    val pctInt = pct.toInt().coerceIn(0, 100)
+    val filledSegments = (pctInt + 19) / 20  // 5 segments, 20% each, round up
+    val countdown = fmtCountdown(resetsAt)
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 8.sp),
+            color = color.copy(alpha = 0.6f),
+        )
+        // 5-segment mini bar
+        Row(horizontalArrangement = Arrangement.spacedBy(1.dp)) {
+            repeat(5) { i ->
+                Box(
+                    modifier = Modifier
+                        .size(width = 5.dp, height = 7.dp)
+                        .clip(RoundedCornerShape(1.dp))
+                        .background(
+                            if (i < filledSegments) color
+                            else MaterialTheme.colorScheme.surfaceContainerHighest,
+                        ),
+                )
+            }
+        }
+        Text(
+            text = "$pctInt%",
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+            color = color,
+            fontFamily = FontFamily.Monospace,
+        )
+        if (countdown.isNotEmpty()) {
+            Text(
+                text = countdown,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                color = color.copy(alpha = 0.6f),
+                fontFamily = FontFamily.Monospace,
+            )
+        }
+    }
+}
+
+private fun fmtCountdown(resetsAtUnixSec: Long?): String {
+    val r = resetsAtUnixSec ?: return ""
+    val remaining = r - (System.currentTimeMillis() / 1000)
+    return when {
+        remaining <= 0 -> "now"
+        remaining < 3600 -> "${remaining / 60}m"
+        remaining < 86400 -> "${remaining / 3600}h"
+        else -> "${remaining / 86400}d"
+    }
+}
+
+private fun fmtMinutesRemaining(minutes: Int): String = when {
+    minutes < 60 -> "${minutes}m left"
+    minutes < 1440 -> "${minutes / 60}h ${minutes % 60}m left"
+    else -> {
+        val days = minutes / 1440
+        val hours = (minutes % 1440) / 60
+        "${days}d ${hours}h left"
+    }
 }
 
 @Composable
@@ -517,6 +812,8 @@ private fun EmptyTabState(tab: GridTab) {
             "No Claude sessions running" to "Start one from tmux or the desktop app."
         GridTab.Waiting ->
             "Nothing waiting on you" to "You'll see approvals here when they arrive."
+        GridTab.Stashed ->
+            "No stashed panes" to "Idle panes appear here after an hour of inactivity."
         GridTab.All ->
             "No panes" to "Open a tmux pane on the host to see it here."
     }

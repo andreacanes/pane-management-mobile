@@ -85,7 +85,7 @@ Every one of these has cost hours at least once — don't re-learn.
 3. **OnePlus "Writing Tools" popup** hijacks taps on AI-augmentable-looking input fields. Dismiss with BACK before interacting
 4. **Tauri-style button bounds include neither icon nor label** — look for `<View clickable="true">` elements in the UI dump, not the `<Text>` inside. Filter by `clickable=true` to find button centers
 5. **BACK to dismiss keyboard can navigate back too far** — on SetupScreen, pressing BACK with no keyboard visible exits the activity. Prefer tapping a non-input area
-6. **ADB drops mid-session** on screen lock / USB power blip. Recover with `adb kill-server && adb start-server` and re-authorize on the phone
+6. **ADB drops mid-session** when the phone sleeps or Tailscale reconnects. Recover with `$ADB connect 100.83.163.105:5555`
 7. **SurfaceFlinger "out of order buffers"** logcat noise is harmless. Filter by PID: `adb logcat --pid=$(adb shell pidof com.andreacanes.panemgmt)`
 8. **`usesCleartextTraffic=true`** in `AndroidManifest.xml` is intentional — the companion is HTTP-only over Tailscale
 
@@ -97,9 +97,12 @@ Use the `build` skill in the outer project — it handles sync.sh + gradlew + AD
 ADB=/mnt/c/Users/Andrea/AppData/Local/Android/Sdk/platform-tools/adb.exe
 /home/andrea/pane-management/sync.sh && \
   cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile && gradlew.bat assembleDebug" && \
+$ADB connect 100.83.163.105:5555 2>/dev/null && \
 $ADB install -r 'C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile\app\build\outputs\apk\debug\app-debug.apk' && \
 $ADB shell am start -n com.andreacanes.panemgmt/.MainActivity
 ```
+
+ADB connects to the phone **wirelessly over Tailscale** (not USB). Always `adb connect` before install.
 
 ## Connection URL
 

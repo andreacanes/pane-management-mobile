@@ -83,6 +83,12 @@ class VoiceInputController(private val context: Context) {
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            // By default SpeechRecognizer finalises after a very short
+            // pause (~2 s). Extend the silence thresholds so longer
+            // dictation doesn't get cut off mid-thought.
+            putExtra("android.speech.extra.SPEECH_INPUT_MINIMUM_LENGTH_MILLIS", 30_000L)
+            putExtra("android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 5_000L)
+            putExtra("android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 5_000L)
         }
 
         recognizer.startListening(intent)

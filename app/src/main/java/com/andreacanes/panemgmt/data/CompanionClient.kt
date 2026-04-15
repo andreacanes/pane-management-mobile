@@ -1,14 +1,21 @@
 package com.andreacanes.panemgmt.data
 
+import com.andreacanes.panemgmt.data.models.AccountRateLimitDto
 import com.andreacanes.panemgmt.data.models.ApprovalDto
 import com.andreacanes.panemgmt.data.models.CaptureDto
+import com.andreacanes.panemgmt.data.models.ConversationResponseDto
+import com.andreacanes.panemgmt.data.models.CreatePaneRequest
+import com.andreacanes.panemgmt.data.models.CreatePaneResponse
 import com.andreacanes.panemgmt.data.models.CreateWindowRequest
 import com.andreacanes.panemgmt.data.models.CreateWindowResponse
+import com.andreacanes.panemgmt.data.models.Decision
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.HealthDto
 import com.andreacanes.panemgmt.data.models.PaneDto
 import com.andreacanes.panemgmt.data.models.ProjectDto
 import com.andreacanes.panemgmt.data.models.ResolveApprovalRequest
+import com.andreacanes.panemgmt.data.models.ImageItemDto
+import com.andreacanes.panemgmt.data.models.SendImageRequest
 import com.andreacanes.panemgmt.data.models.SendInputRequest
 import com.andreacanes.panemgmt.data.models.SendKeyRequest
 import com.andreacanes.panemgmt.data.models.SendVoiceRequest
@@ -97,6 +104,17 @@ class CompanionClient(
             parameter("lines", lines)
         }.body()
 
+    /**
+     * Fetch structured conversation messages from the Claude Code JSONL
+     * session log bound to this pane. Returns 404 when the pane has no
+     * bound session or the JSONL file is missing — caller should fall
+     * back to [capture].
+     */
+    suspend fun conversation(paneId: String, after: String? = null): ConversationResponseDto =
+        client.get("/api/v1/panes/$paneId/conversation") {
+            if (after != null) parameter("after", after)
+        }.body()
+
     suspend fun sendInput(paneId: String, text: String, submit: Boolean = true) {
         client.post("/api/v1/panes/$paneId/input") {
             contentType(ContentType.Application.Json)
@@ -108,6 +126,23 @@ class CompanionClient(
         client.post("/api/v1/panes/$paneId/voice") {
             contentType(ContentType.Application.Json)
             setBody(SendVoiceRequest(transcript = transcript, submit = true, locale = locale))
+        }
+    }
+
+    /**
+     * Upload one or more base64-encoded images to a pane. The companion
+     * writes each to `/tmp/pane-mgmt/` on WSL and types a single message
+     * referencing every path so Claude Code can read them with its Read
+     * tool on the same turn.
+     */
+    suspend fun sendImage(
+        paneId: String,
+        images: List<ImageItemDto>,
+        prompt: String? = null,
+    ) {
+        client.post("/api/v1/panes/$paneId/image") {
+            contentType(ContentType.Application.Json)
+            setBody(SendImageRequest(images = images, prompt = prompt))
         }
     }
 
@@ -135,7 +170,11 @@ class CompanionClient(
     suspend fun usage(): UsageDto =
         client.get("/api/v1/usage").body()
 
-    suspend fun resolveApproval(id: String, decision: String, reason: String? = null) {
+    /** Per-account Anthropic rate limit utilization (5h + 7d). */
+    suspend fun rateLimits(): List<AccountRateLimitDto> =
+        client.get("/api/v1/rate-limits").body()
+
+    suspend fun resolveApproval(id: String, decision: Decision, reason: String? = null) {
         client.post("/api/v1/approvals/$id") {
             contentType(ContentType.Application.Json)
             setBody(ResolveApprovalRequest(decision = decision, reason = reason))
@@ -168,6 +207,24 @@ class CompanionClient(
     suspend fun killWindow(sessionName: String, windowIndex: Int) {
         client.delete("/api/v1/windows/$sessionName/$windowIndex")
     }
+
+    /**
+     * Kill a single tmux pane by its composite id (e.g. "main:3.1").
+     * Returns 204 on success.
+     */
+    suspend fun killPane(paneId: String) {
+        client.delete("/api/v1/panes/$paneId")
+    }
+
+    /**
+     * Split a new pane in the same window as [targetPaneId], launching
+     * the given account's Claude launcher inside it.
+     */
+    suspend fun createPane(targetPaneId: String, account: String): CreatePaneResponse =
+        client.post("/api/v1/panes") {
+            contentType(ContentType.Application.Json)
+            setBody(CreatePaneRequest(targetPaneId = targetPaneId, account = account))
+        }.body()
 
     // ---- WebSocket --------------------------------------------------------
 

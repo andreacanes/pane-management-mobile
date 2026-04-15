@@ -43,6 +43,10 @@ data class PaneDto(
     /** "andrea" | "bravura" | null — detected from child process env. */
     @SerialName("claude_account") val claudeAccount: String? = null,
     @SerialName("updated_at") val updatedAt: Long,
+    /** Epoch ms of the last conversation message (JSONL mtime). Null
+     *  when the pane has no bound Claude session or the JSONL doesn't
+     *  exist yet. Use this for "real activity" filters. */
+    @SerialName("last_activity_at") val lastActivityAt: Long? = null,
 )
 
 @Serializable
@@ -84,8 +88,26 @@ data class SendKeyRequest(
 )
 
 @Serializable
+data class ImageItemDto(
+    @SerialName("image_base64") val imageBase64: String,
+    @SerialName("media_type") val mediaType: String = "image/png",
+)
+
+@Serializable
+data class SendImageRequest(
+    val images: List<ImageItemDto>,
+    val prompt: String? = null,
+)
+
+@Serializable
+enum class Decision {
+    @SerialName("allow") Allow,
+    @SerialName("deny") Deny,
+}
+
+@Serializable
 data class ResolveApprovalRequest(
-    val decision: String,
+    val decision: Decision,
     val reason: String? = null,
 )
 
@@ -124,6 +146,17 @@ data class CreateWindowResponse(
     @SerialName("pane_id") val paneId: String,
 )
 
+@Serializable
+data class CreatePaneRequest(
+    @SerialName("target_pane_id") val targetPaneId: String,
+    val account: String,
+)
+
+@Serializable
+data class CreatePaneResponse(
+    @SerialName("pane_id") val paneId: String,
+)
+
 /**
  * Aggregate usage summary returned by `GET /api/v1/usage`. Mirrors the
  * ad-hoc JSON object built in `companion/http.rs::usage_summary`.
@@ -141,6 +174,40 @@ data class UsageDto(
     val totalTokens: Long
         get() = inputTokens + outputTokens + cacheWriteTokens + cacheReadTokens
 }
+
+/**
+ * Per-account Anthropic rate limit utilization. Returned by
+ * `GET /api/v1/rate-limits`. Timestamps are Unix seconds.
+ */
+@Serializable
+data class AccountRateLimitDto(
+    val account: String,
+    val label: String,
+    @SerialName("five_hour_pct") val fiveHourPct: Double,
+    @SerialName("five_hour_resets_at") val fiveHourResetsAt: Long? = null,
+    @SerialName("seven_day_pct") val sevenDayPct: Double,
+    @SerialName("seven_day_resets_at") val sevenDayResetsAt: Long? = null,
+)
+
+// ---------------------------------------------------------------------------
+// Conversation (JSONL session transcript)
+// ---------------------------------------------------------------------------
+
+@Serializable
+data class ConversationMessageDto(
+    val uuid: String,
+    val role: String,
+    val text: String,
+    val timestamp: String,
+    @SerialName("tool_name") val toolName: String? = null,
+    @SerialName("tool_input") val toolInput: JsonElement? = null,
+)
+
+@Serializable
+data class ConversationResponseDto(
+    @SerialName("session_id") val sessionId: String,
+    val messages: List<ConversationMessageDto>,
+)
 
 /**
  * Tagged envelope for WebSocket events. The Rust side uses
@@ -191,7 +258,7 @@ sealed class EventDto {
     @SerialName("approval_resolved")
     data class ApprovalResolved(
         val id: String,
-        val decision: String,
+        val decision: Decision,
         val at: Long,
     ) : EventDto()
 
@@ -205,6 +272,13 @@ sealed class EventDto {
         val kind: String = "input",
         @SerialName("project_display_name") val projectDisplayName: String? = null,
         @SerialName("claude_account") val claudeAccount: String? = null,
+    ) : EventDto()
+
+    @Serializable
+    @SerialName("pane_removed")
+    data class PaneRemoved(
+        @SerialName("pane_id") val paneId: String,
+        val at: Long,
     ) : EventDto()
 
     @Serializable
