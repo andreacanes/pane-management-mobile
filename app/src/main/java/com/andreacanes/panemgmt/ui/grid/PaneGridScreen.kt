@@ -148,10 +148,13 @@ fun PaneGridScreen(
 
     // Runtime POST_NOTIFICATIONS on API 33+. Without this the service
     // foreground notification and all approval/attention notifications
-    // are enqueued but blocked with numBlocked++.
+    // are enqueued but blocked with numBlocked++. We track the denial
+    // state explicitly so the user gets a persistent, clickable banner
+    // instead of silently missing every approval notification.
+    var notifPermissionDenied by remember { mutableStateOf(false) }
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
-        onResult = { /* result ignored — if denied, user can re-grant in settings */ },
+        onResult = { granted -> notifPermissionDenied = !granted },
     )
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -159,6 +162,7 @@ fun PaneGridScreen(
                 context,
                 android.Manifest.permission.POST_NOTIFICATIONS,
             ) == PackageManager.PERMISSION_GRANTED
+            notifPermissionDenied = !granted
             if (!granted) {
                 notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
             }
@@ -399,6 +403,31 @@ fun PaneGridScreen(
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
+            if (notifPermissionDenied) {
+                Card(
+                    onClick = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            notifPermissionLauncher.launch(
+                                android.Manifest.permission.POST_NOTIFICATIONS,
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    ),
+                ) {
+                    Text(
+                        "Notifications disabled — approval prompts will be missed. Tap to grant.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            }
+
             TabRow(selectedTabIndex = pagerState.currentPage) {
                 GridTab.entries.forEachIndexed { index, tab ->
                     val count = when (tab) {

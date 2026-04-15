@@ -25,7 +25,9 @@ import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.DefaultRequest
+import io.ktor.client.plugins.HttpResponseValidator
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
@@ -35,6 +37,7 @@ import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.URLBuilder
@@ -44,12 +47,16 @@ import io.ktor.http.takeFrom
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
+import java.io.IOException
 import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Ktor client for the pane-management companion service.
@@ -83,6 +90,24 @@ class CompanionClient(
             url.protocol = parsedBase.protocol
             url.host = parsedBase.host
             url.port = parsedBase.port
+        }
+        // Surface the Rust-side error JSON `{"error": "tmux error: ..."}`
+        // in the thrown exception. Without this, callers see a generic
+        // "Server error: 502" instead of the actual reason.
+        HttpResponseValidator {
+            handleResponseExceptionWithRequest { cause, _ ->
+                if (cause !is ResponseException) return@handleResponseExceptionWithRequest
+                val body = runCatching { cause.response.bodyAsText() }
+                    .getOrNull().orEmpty()
+                val parsed = runCatching {
+                    json.parseToJsonElement(body).jsonObject["error"]
+                        ?.jsonPrimitive
+                        ?.contentOrNull
+                }.getOrNull()
+                if (!parsed.isNullOrBlank()) {
+                    throw IOException("${cause.response.status}: $parsed", cause)
+                }
+            }
         }
     }
 
@@ -218,12 +243,17 @@ class CompanionClient(
 
     /**
      * Split a new pane in the same window as [targetPaneId], launching
-     * the given account's Claude launcher inside it.
+     * the given account's Claude launcher inside it. [direction] is
+     * "horizontal" (default, side-by-side) or "vertical" (stacked below).
      */
-    suspend fun createPane(targetPaneId: String, account: String): CreatePaneResponse =
+    suspend fun createPane(
+        targetPaneId: String,
+        account: String,
+        direction: String? = null,
+    ): CreatePaneResponse =
         client.post("/api/v1/panes") {
             contentType(ContentType.Application.Json)
-            setBody(CreatePaneRequest(targetPaneId = targetPaneId, account = account))
+            setBody(CreatePaneRequest(targetPaneId = targetPaneId, account = account, direction = direction))
         }.body()
 
     // ---- WebSocket --------------------------------------------------------

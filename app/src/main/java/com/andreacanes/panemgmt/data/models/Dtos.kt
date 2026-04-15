@@ -150,6 +150,8 @@ data class CreateWindowResponse(
 data class CreatePaneRequest(
     @SerialName("target_pane_id") val targetPaneId: String,
     val account: String,
+    /** "horizontal" (side-by-side) or "vertical" (stacked). Null → server default = horizontal. */
+    val direction: String? = null,
 )
 
 @Serializable

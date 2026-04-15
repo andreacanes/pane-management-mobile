@@ -96,6 +96,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import com.andreacanes.panemgmt.ViewedPaneBus
 import com.andreacanes.panemgmt.data.AuthStore
 import com.andreacanes.panemgmt.data.CompanionClient
 import com.andreacanes.panemgmt.data.models.ApprovalDto
@@ -184,6 +185,13 @@ fun PaneDetailScreen(
 
     val voice = remember { VoiceInputController(context) }
     val clipboard = LocalClipboardManager.current
+
+    // Tell ApprovalService the user is now looking at this pane so it can
+    // dismiss any pending approval/attention notifications for it. Re-fires
+    // when paneId changes (e.g. swipe between siblings).
+    LaunchedEffect(paneId) {
+        ViewedPaneBus.post(paneId)
+    }
 
     fun startVoiceCapture() {
         voiceListening = true
@@ -1412,6 +1420,36 @@ private fun ApprovalDialog(
     val confirmLabel = if (isPlanApproval) "Approve plan" else "Allow"
     val denyLabel = if (isPlanApproval) "Keep planning" else "Deny"
 
+    // For ExitPlanMode, "Keep planning" is benign — Claude just stays
+    // in planning mode. For everything else, Deny actually stops the
+    // tool call, which is hard to undo, so we ask for a second tap.
+    var confirmDeny by remember(approval.id) { mutableStateOf(false) }
+
+    if (confirmDeny) {
+        AlertDialog(
+            onDismissRequest = { confirmDeny = false },
+            title = { Text("Deny this request?") },
+            text = {
+                Text(
+                    "Claude will be told the action was denied. The current tool call stops; Claude may pick a different approach or ask again.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = onDeny,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) { Text("Yes, deny") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeny = false }) { Text("Cancel") }
+            },
+        )
+        return
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -1467,7 +1505,11 @@ private fun ApprovalDialog(
             Button(onClick = onAllow) { Text(confirmLabel) }
         },
         dismissButton = {
-            TextButton(onClick = onDeny) { Text(denyLabel) }
+            TextButton(
+                onClick = {
+                    if (isPlanApproval) onDeny() else confirmDeny = true
+                },
+            ) { Text(denyLabel) }
         },
     )
 }
