@@ -41,6 +41,8 @@ import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Send
@@ -97,6 +99,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import com.andreacanes.panemgmt.data.AuthStore
 import com.andreacanes.panemgmt.data.CompanionClient
 import com.andreacanes.panemgmt.data.models.ApprovalDto
+import com.andreacanes.panemgmt.data.models.ConversationMessageDto
 import com.andreacanes.panemgmt.data.models.Decision
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.ImageItemDto
@@ -110,7 +113,9 @@ import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 
-private const val CAPTURE_LINES = 5000
+// Capture only grabs the live terminal frame now — the JSONL
+// transcript (via /conversation) provides real scrollback.
+private const val CAPTURE_LINES = 200
 
 /**
  * Incremental line-cleaning cache. Keeps a map from raw line → parsed
@@ -149,6 +154,12 @@ fun PaneDetailScreen(
     val scope = rememberCoroutineScope()
 
     var lines by remember { mutableStateOf<List<String>>(emptyList()) }
+    // Parsed JSONL transcript (full session history). Claude Code writes
+    // one record per message into ~/.claude/projects/<cwd>/<sid>.jsonl,
+    // so this is the only source of scrollback that survives the TUI's
+    // in-place redraws. The live `/capture` result is overlaid after it
+    // for the in-flight turn.
+    var transcriptMessages by remember { mutableStateOf<List<ConversationMessageDto>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
     var inputText by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
@@ -160,8 +171,7 @@ fun PaneDetailScreen(
     var showKillDialog by remember { mutableStateOf(false) }
     var killing by remember { mutableStateOf(false) }
     var showEffortMenu by remember { mutableStateOf(false) }
-    var showModeMenu by remember { mutableStateOf(false) }
-    var pendingEffort by remember { mutableStateOf<String?>(null) }
+    var pendingEffort by remember(paneId) { mutableStateOf<String?>(null) }
     var splitting by remember { mutableStateOf(false) }
     var switching by remember { mutableStateOf(false) }
     // Sibling panes in the same tmux window, sorted by pane index — drives
@@ -223,16 +233,26 @@ fun PaneDetailScreen(
     LaunchedEffect(config, paneId) {
         val cfg = config ?: return@LaunchedEffect
         var refetchJob: kotlinx.coroutines.Job? = null
+        var transcriptJob: kotlinx.coroutines.Job? = null
         var backoff = 1_000L
         while (true) {
             val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
-            suspend fun refetch() {
+            suspend fun refetchCapture() {
                 runCatching { client.capture(paneId, lines = CAPTURE_LINES) }
                     .onSuccess { lines = it.lines }
                     .onFailure { error = it.message }
             }
+            suspend fun refetchTranscript() {
+                // 404 is expected on panes that haven't produced a JSONL
+                // yet (no session bound, or `cld` still sitting at its
+                // splash). Silently leave the transcript empty in that
+                // case — the capture overlay will still render.
+                runCatching { client.conversation(paneId) }
+                    .onSuccess { transcriptMessages = it.messages }
+            }
             try {
-                refetch()
+                refetchCapture()
+                refetchTranscript()
                 approvals = client.listApprovals().filter { it.paneId == paneId }
                 val allPanes = runCatching { client.listPanes() }.getOrDefault(emptyList())
                 paneInfo = allPanes.firstOrNull { it.id == paneId }
@@ -258,10 +278,21 @@ fun PaneDetailScreen(
                         }
                         is EventDto.PaneOutputChanged -> {
                             if (ev.paneId == paneId) {
+                                // Capture: fast, debounced 250ms so a burst
+                                // of status-bar ticks collapses into one fetch.
                                 refetchJob?.cancel()
                                 refetchJob = scope.launch {
                                     kotlinx.coroutines.delay(250)
-                                    refetch()
+                                    refetchCapture()
+                                }
+                                // Transcript: JSONL only grows after Claude
+                                // flushes a turn — polling faster than ~2s
+                                // would just re-read the same file.
+                                if (transcriptJob?.isActive != true) {
+                                    transcriptJob = scope.launch {
+                                        kotlinx.coroutines.delay(2_000)
+                                        refetchTranscript()
+                                    }
                                 }
                             }
                         }
@@ -280,12 +311,14 @@ fun PaneDetailScreen(
                 }
             } catch (t: kotlinx.coroutines.CancellationException) {
                 refetchJob?.cancel()
+                transcriptJob?.cancel()
                 runCatching { client.close() }
                 throw t
             } catch (t: Throwable) {
                 error = t.message ?: t::class.simpleName
             } finally {
                 refetchJob?.cancel()
+                transcriptJob?.cancel()
                 runCatching { client.close() }
             }
             kotlinx.coroutines.delay(backoff)
@@ -299,16 +332,44 @@ fun PaneDetailScreen(
     // majority on each refetch) skip all ANSI/regex parsing.
     val onSurface = MaterialTheme.colorScheme.onSurface
     val lineCache = remember { LineCache() }
-    val cleaned = remember(lines, onSurface) { cleanOutputLines(lines, onSurface, lineCache) }
+    // Transcript (full JSONL history) sits above the live capture overlay
+    // with a dim separator. The capture reflects what Claude is drawing
+    // right now — useful while a response is streaming and hasn't yet
+    // been flushed to JSONL. Some duplication at the boundary is tolerated.
+    val transcriptRawLines = remember(transcriptMessages) {
+        renderTranscriptLines(transcriptMessages)
+    }
+    val mergedRawLines = remember(transcriptRawLines, lines) {
+        if (transcriptRawLines.isEmpty()) {
+            lines
+        } else if (lines.isEmpty()) {
+            transcriptRawLines
+        } else {
+            transcriptRawLines + LIVE_OVERLAY_SEPARATOR + lines
+        }
+    }
+    val cleaned = remember(mergedRawLines, onSurface) {
+        cleanOutputLines(mergedRawLines, onSurface, lineCache)
+    }
     val displayLines = cleaned.lines
     val contextPct = cleaned.contextPct
+    // Mode is a TUI status-line thing — only readable from live capture.
     val claudeMode = remember(lines) { detectClaudeMode(lines) }
+    // Effort is a per-session setting. Try live capture first (for the
+    // just-set case where the status line still shows "effort: …"), then
+    // fall back to scanning the JSONL transcript for the last `/effort`
+    // slash command the user sent. That makes the chip reflect the
+    // session's actual inherited level after a resume, not "—".
     val detectedEffort = remember(lines) { detectEffort(lines) }
-    var lastKnownEffort by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(detectedEffort) {
-        if (detectedEffort != null) {
-            lastKnownEffort = detectedEffort
-            if (detectedEffort == pendingEffort) pendingEffort = null
+    val transcriptEffort = remember(transcriptMessages) {
+        detectEffortInTranscript(transcriptMessages)
+    }
+    var lastKnownEffort by remember(paneId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(detectedEffort, transcriptEffort) {
+        val found = detectedEffort ?: transcriptEffort
+        if (found != null) {
+            lastKnownEffort = found
+            if (found == pendingEffort) pendingEffort = null
         }
     }
     val currentEffort = pendingEffort ?: lastKnownEffort
@@ -319,33 +380,46 @@ fun PaneDetailScreen(
     // is impossible in practice. `stickToBottom` flips off when the
     // user releases a scroll away from the tail and back on when they
     // return near the tail.
-    val listState = rememberLazyListState()
-    var stickToBottom by remember { mutableStateOf(true) }
-    LaunchedEffect(listState) {
-        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
-            if (!scrolling) {
+    // Fresh listState per pane so navigation doesn't inherit a stale
+    // scroll offset from a previous (often longer) transcript.
+    val listState = remember(paneId) { androidx.compose.foundation.lazy.LazyListState() }
+    // stickToBottom is a boolean latch, not a pure derivation. It starts
+    // true (auto-scroll on initial load), only flips to false while the
+    // user is actively dragging away from the tail, and flips back to
+    // true when they drag near the tail again. The earlier derivedStateOf
+    // version flipped false the moment layout revealed only a top slice
+    // of a long transcript, killing the initial auto-scroll.
+    var stickToBottom by remember(paneId) { mutableStateOf(true) }
+    LaunchedEffect(listState, paneId) {
+        snapshotFlow {
+            Triple(
+                listState.isScrollInProgress,
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset,
+            )
+        }.collect { (scrolling, _, _) ->
+            if (scrolling) {
                 val info = listState.layoutInfo
-                val last = info.visibleItemsInfo.lastOrNull()
                 val total = info.totalItemsCount
-                stickToBottom = last == null || total == 0 || last.index >= total - 2
+                val last = info.visibleItemsInfo.lastOrNull()
+                stickToBottom = total == 0 || (last != null && last.index >= total - 2)
             }
         }
     }
-    LaunchedEffect(displayLines.size) {
+    LaunchedEffect(displayLines.size, paneId) {
         if (displayLines.isNotEmpty() && stickToBottom) {
             delay(50)
             listState.scrollToItem(displayLines.lastIndex)
         }
     }
 
-    // Auto-scroll to bottom whenever the keyboard opens or closes. Without
-    // this the LazyColumn keeps the same first-visible-item, so opening
-    // the keyboard pushes the latest output off the bottom of the now-
-    // shorter visible area and the user has to scroll up by hand.
+    // Auto-scroll to bottom whenever the keyboard opens or closes — but only
+    // if the user was already tailing. IME-driven layout shouldn't yank a
+    // user who has scrolled up to read scrollback.
     @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
     val imeVisible = WindowInsets.isImeVisible
     LaunchedEffect(imeVisible) {
-        if (displayLines.isNotEmpty()) {
+        if (displayLines.isNotEmpty() && stickToBottom) {
             delay(120) // wait for the IME-driven layout pass to settle
             listState.scrollToItem(displayLines.lastIndex)
         }
@@ -486,24 +560,12 @@ fun PaneDetailScreen(
                 },
                 actions = {
                     contextPct?.let { ContextChip(pct = it) }
-                    ModeChip(
-                        mode = claudeMode,
-                        expanded = showModeMenu,
-                        onToggle = { showModeMenu = !showModeMenu },
-                        onSelect = { target ->
-                            showModeMenu = false
-                            val order = listOf(
-                                ClaudeMode.Normal,
-                                ClaudeMode.AutoAccept,
-                                ClaudeMode.Plan,
-                                ClaudeMode.Bypass,
-                            )
-                            val from = order.indexOf(claudeMode).coerceAtLeast(0)
-                            val to = order.indexOf(target).coerceAtLeast(0)
-                            val distance = ((to - from) + order.size) % order.size
-                            repeat(distance) { sendKey("S-Tab") }
-                        },
-                    )
+                    // One tap = one Shift-Tab. Multi-step dropdown looked right
+                    // but shipped wrong: Claude Code's actual cycle order isn't
+                    // {Normal, AutoAccept, Plan, Bypass} so the computed jump
+                    // count would land on the wrong mode. Cycling one step per
+                    // tap is short and correct.
+                    ModeChip(mode = claudeMode, onClick = { cycleMode() })
                     EffortChip(
                         current = currentEffort,
                         expanded = showEffortMenu,
@@ -631,12 +693,21 @@ fun PaneDetailScreen(
                 }
             }
 
-            // Output view
+            // Output view + floating quick-key column on the right edge.
+            // Keys used to live in a full-width row below the output; moving
+            // them inside the output Box as an overlay reclaims vertical
+            // space for the chat while keeping arrow/Ent/Esc/Tab one tap away.
             Box(Modifier.weight(1f)) {
                 SelectionContainer {
                     LazyColumn(
                         state = listState,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            start = 12.dp,
+                            top = 12.dp,
+                            // Reserve the right gutter for the floating key column.
+                            end = 60.dp,
+                            bottom = 12.dp,
+                        ),
                     ) {
                         items(
                             count = displayLines.size,
@@ -664,6 +735,12 @@ fun PaneDetailScreen(
                         }
                     }
                 }
+                FloatingQuickKeys(
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 6.dp),
+                    onKey = { key -> sendKey(key) },
+                )
             }
             error?.let {
                 Text(
@@ -698,21 +775,6 @@ fun PaneDetailScreen(
                         )
                     }
                 }
-            }
-
-            // Quick-key bar for navigating Claude Code pickers (AskUserQuestion,
-            // plan-mode menus, etc) that use arrow keys + Enter, not typed text.
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
-            ) {
-                QuickKeyButton(icon = { Icon(Icons.Default.KeyboardArrowUp, "Up") }) { sendKey("Up") }
-                QuickKeyButton(icon = { Icon(Icons.Default.KeyboardArrowDown, "Down") }) { sendKey("Down") }
-                QuickKeyButton(icon = { Text("↵", style = MaterialTheme.typography.titleMedium) }) { sendKey("Enter") }
-                QuickKeyButton(icon = { Text("Esc", style = MaterialTheme.typography.labelSmall) }) { sendKey("Escape") }
-                QuickKeyButton(icon = { Text("Tab", style = MaterialTheme.typography.labelSmall) }) { sendKey("Tab") }
             }
 
             // Attachment chips — one per pending image, horizontally
@@ -1000,6 +1062,21 @@ internal fun detectEffort(lines: List<String>): String? {
 }
 
 /**
+ * Scan the JSONL transcript for the most recent `/effort <level>` slash
+ * command a user ran. Gives the effort chip something to display after
+ * a session resume where the live TUI no longer echoes the command.
+ */
+internal fun detectEffortInTranscript(messages: List<ConversationMessageDto>): String? {
+    val pat = Regex("""/effort\s+(low|medium|high|max)\b""", RegexOption.IGNORE_CASE)
+    for (msg in messages.asReversed()) {
+        if (msg.role != "user") continue
+        val m = pat.find(msg.text) ?: continue
+        return m.groupValues[1].lowercase()
+    }
+    return null
+}
+
+/**
  * Strip pure-visual lines (Unicode box drawing, shading, full-block) from
  * Claude's captured terminal output and collapse runs of empty / visual-only
  * lines into a single blank entry. Also drops lines that contain a long
@@ -1067,6 +1144,87 @@ private fun cleanOutputLines(raw: List<String>, defaultColor: Color, cache: Line
     return CleanedOutput(parsed, contextPct)
 }
 
+// Visual delimiter between the JSONL transcript above and the live
+// /capture output below. Uses box-drawing dashes (short enough not to
+// trip `LONG_DASH_RUN`) and a dim grey colour so it looks like chrome,
+// not chat content.
+private val LIVE_OVERLAY_SEPARATOR: List<String> = listOf(
+    "",
+    "\u001B[2;90m───── live terminal ─────\u001B[0m",
+    "",
+)
+
+/**
+ * Flatten parsed conversation messages into raw ANSI-styled lines that
+ * feed the same rendering pipeline as `/capture`. User prompts get a
+ * cyan `❯`; assistant text stays default colour; tool invocations get a
+ * green `⏺` followed by the tool name and a short argument summary.
+ * Splitting on newline inside a message preserves code blocks and
+ * multi-line prompts verbatim.
+ */
+private fun renderTranscriptLines(messages: List<ConversationMessageDto>): List<String> {
+    if (messages.isEmpty()) return emptyList()
+    val out = mutableListOf<String>()
+    for (msg in messages) {
+        when (msg.role) {
+            "user" -> {
+                if (out.isNotEmpty()) out.add("")
+                val textLines = msg.text.split('\n')
+                val first = textLines.firstOrNull().orEmpty()
+                out.add("\u001B[1;36m❯\u001B[0m \u001B[1m$first\u001B[0m")
+                textLines.drop(1).forEach { line -> out.add("  $line") }
+            }
+            "assistant" -> {
+                if (out.isNotEmpty()) out.add("")
+                if (msg.text.isNotBlank()) {
+                    msg.text.split('\n').forEach { out.add(it) }
+                }
+                val toolName = msg.toolName
+                if (toolName != null) {
+                    val summary = summarizeToolUse(toolName, msg.toolInput)
+                    val header = buildString {
+                        append("\u001B[32m⏺\u001B[0m \u001B[1m")
+                        append(toolName)
+                        append("\u001B[0m")
+                        if (summary.isNotEmpty()) append("(").append(summary).append(")")
+                    }
+                    if (msg.text.isNotBlank()) out.add("")
+                    out.add(header)
+                }
+            }
+        }
+    }
+    return out
+}
+
+/**
+ * Produce a one-line argument summary for a tool_use block — Bash gets
+ * the first line of its command, file tools the basename, etc. Mirrors
+ * what Claude would have printed inline in the terminal without
+ * re-implementing its full tool-card formatting.
+ */
+private fun summarizeToolUse(toolName: String, input: JsonElement?): String {
+    val obj = input as? kotlinx.serialization.json.JsonObject ?: return ""
+    fun str(key: String): String? {
+        val el = obj[key] ?: return null
+        if (el is kotlinx.serialization.json.JsonNull) return null
+        val prim = el as? kotlinx.serialization.json.JsonPrimitive ?: return null
+        return prim.content
+    }
+    return when (toolName) {
+        "Bash" -> str("command")?.split('\n')?.firstOrNull()?.take(120).orEmpty()
+        "Edit", "Write", "MultiEdit", "Read",
+        "NotebookEdit", "NotebookRead" -> str("file_path")?.substringAfterLast('/').orEmpty()
+        "Grep" -> str("pattern")?.take(60).orEmpty()
+        "Glob" -> str("pattern").orEmpty()
+        "WebFetch" -> str("url").orEmpty()
+        "WebSearch" -> str("query")?.take(60).orEmpty()
+        "Task", "Agent" -> str("description") ?: str("subagent_type").orEmpty()
+        "TodoWrite" -> "…"
+        else -> ""
+    }
+}
+
 @OptIn(ExperimentalSerializationApi::class)
 private val prettyJsonFmt = Json { prettyPrint = true; prettyPrintIndent = "  " }
 
@@ -1089,14 +1247,16 @@ private fun paneProjectLabel(encoded: String?): String? {
  */
 @Composable
 private fun QuickKeyButton(
+    modifier: Modifier = Modifier,
     icon: @Composable () -> Unit,
     onClick: () -> Unit,
 ) {
     FilledIconButton(
         onClick = onClick,
-        modifier = Modifier.size(40.dp),
+        modifier = modifier.size(44.dp),
         colors = IconButtonDefaults.filledIconButtonColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                .copy(alpha = 0.88f),
             contentColor = MaterialTheme.colorScheme.onSurface,
         ),
     ) {
@@ -1104,46 +1264,53 @@ private fun QuickKeyButton(
     }
 }
 
+/**
+ * Vertical stack of quick-keys overlaid on the right edge of the chat
+ * output. Rewires arrow navigation (Up/Down/Left/Right) plus the three
+ * submit-shape keys Claude's pickers need (Ent, Esc, Tab). Translucent
+ * background so text behind stays readable.
+ */
 @Composable
-private fun ModeChip(
-    mode: ClaudeMode,
-    expanded: Boolean,
-    onToggle: () -> Unit,
-    onSelect: (ClaudeMode) -> Unit,
+private fun FloatingQuickKeys(
+    modifier: Modifier = Modifier,
+    onKey: (String) -> Unit,
 ) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        QuickKeyButton(icon = { Icon(Icons.Default.KeyboardArrowUp, "Up") }) { onKey("Up") }
+        QuickKeyButton(icon = { Icon(Icons.Default.KeyboardArrowDown, "Down") }) { onKey("Down") }
+        QuickKeyButton(icon = { Icon(Icons.Default.KeyboardArrowLeft, "Left") }) { onKey("Left") }
+        QuickKeyButton(icon = { Icon(Icons.Default.KeyboardArrowRight, "Right") }) { onKey("Right") }
+        QuickKeyButton(icon = { Text("Ent", style = MaterialTheme.typography.labelSmall) }) { onKey("Enter") }
+        QuickKeyButton(icon = { Text("Esc", style = MaterialTheme.typography.labelSmall) }) { onKey("Escape") }
+        QuickKeyButton(icon = { Text("Tab", style = MaterialTheme.typography.labelSmall) }) { onKey("Tab") }
+    }
+}
+
+@Composable
+private fun ModeChip(mode: ClaudeMode, onClick: () -> Unit) {
     val color = when (mode) {
         ClaudeMode.Normal     -> StatusColors.Idle
         ClaudeMode.AutoAccept -> StatusColors.Running
         ClaudeMode.Plan       -> StatusColors.Done
         ClaudeMode.Bypass     -> Color(0xFFFF6B6B)
     }
-    Box(modifier = Modifier.padding(end = 2.dp)) {
-        Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(999.dp))
-                .background(color.copy(alpha = 0.14f))
-                .clickable(onClick = onToggle)
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "Mode",
-                style = MaterialTheme.typography.labelSmall,
-                color = color,
-            )
-        }
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = onToggle,
-        ) {
-            ClaudeMode.values().forEach { m ->
-                val marker = if (m == mode) "• " else "  "
-                DropdownMenuItem(
-                    text = { Text("$marker${m.label}") },
-                    onClick = { onSelect(m) },
-                )
-            }
-        }
+    Row(
+        modifier = Modifier
+            .padding(end = 2.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(color.copy(alpha = 0.14f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = mode.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+        )
     }
 }
 
