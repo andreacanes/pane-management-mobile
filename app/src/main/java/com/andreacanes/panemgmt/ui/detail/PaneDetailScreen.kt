@@ -108,7 +108,9 @@ import com.andreacanes.panemgmt.ui.common.collectVoiceInput
 import com.andreacanes.panemgmt.ui.theme.StatusColors
 import com.andreacanes.panemgmt.voice.VoiceInputController
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -117,25 +119,37 @@ import kotlinx.serialization.json.JsonElement
 // `capture-pane -S -` which grabs the full history buffer.
 private const val CAPTURE_LINES = 0
 
+// Max entries retained by LineCache. With /capture now returning full
+// replayed scrollback (typically 400-700 lines) and ANSI-decorated strings
+// that hash-differ on tiny pen-state changes, a generous cache cuts the
+// per-refetch parseAnsiLine work dramatically. 2000 entries ~= 2-3 refetches'
+// worth — plenty for LRU re-use while capping memory.
+private const val LINE_CACHE_MAX = 2000
+private const val LINE_CACHE_TRIM_TARGET = 1500
+
 /**
  * Incremental line-cleaning cache. Keeps a map from raw line → parsed
- * AnnotatedString so that on a 1000-line refetch where only the last
- * few lines changed, we skip the expensive stripAnsi + regex + ANSI-parse
- * work for everything that's unchanged. The cache is keyed on the raw
- * String identity (which the server returns verbatim for unchanged lines),
- * capped loosely at 2× CAPTURE_LINES to avoid unbounded growth.
+ * AnnotatedString so that on a refetch where only the last few lines
+ * changed, we skip the expensive stripAnsi + regex + ANSI-parse work for
+ * everything that's unchanged. Keyed on the raw String (server returns
+ * verbatim for unchanged lines).
+ *
+ * Uses `accessOrder = true` so get() promotes entries to "recently used".
+ * When capacity is exceeded we evict the least-recently-used entries down
+ * to LINE_CACHE_TRIM_TARGET.
  */
 private class LineCache {
-    private val cache = LinkedHashMap<String, AnnotatedString>(512, 0.75f, true)
+    private val cache = LinkedHashMap<String, AnnotatedString>(LINE_CACHE_MAX, 0.75f, true)
 
     fun getOrParse(raw: String, defaultColor: Color): AnnotatedString {
         cache[raw]?.let { return it }
         val parsed = if (raw.isBlank()) AnnotatedString("")
                      else parseAnsiLine(raw, defaultColor)
         cache[raw] = parsed
-        if (cache.size > CAPTURE_LINES * 2) {
+        if (cache.size > LINE_CACHE_MAX) {
+            val evict = cache.size - LINE_CACHE_TRIM_TARGET
             val iter = cache.entries.iterator()
-            repeat(cache.size - CAPTURE_LINES) { if (iter.hasNext()) { iter.next(); iter.remove() } }
+            repeat(evict) { if (iter.hasNext()) { iter.next(); iter.remove() } }
         }
         return parsed
     }
@@ -165,6 +179,7 @@ fun PaneDetailScreen(
     var showKillDialog by remember { mutableStateOf(false) }
     var killing by remember { mutableStateOf(false) }
     var showEffortMenu by remember { mutableStateOf(false) }
+    var showModeMenu by remember { mutableStateOf(false) }
     var pendingEffort by remember(paneId) { mutableStateOf<String?>(null) }
     var splitting by remember { mutableStateOf(false) }
     var switching by remember { mutableStateOf(false) }
@@ -233,7 +248,13 @@ fun PaneDetailScreen(
     // last 200 lines from the companion.
     LaunchedEffect(config, paneId) {
         val cfg = config ?: return@LaunchedEffect
-        var refetchJob: kotlinx.coroutines.Job? = null
+        // Coalescing refetch channel: events arriving during an in-flight
+        // fetch get conflated into a single follow-up fetch, not a cascade
+        // of cancelled half-fetches. Previous `refetchJob.cancel()` pattern
+        // killed the HTTP request mid-flight when events arrived faster
+        // than fetches completed, starving the phone of updates.
+        val refetchChannel =
+            kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
         var backoff = 1_000L
         while (true) {
             val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
@@ -241,6 +262,19 @@ fun PaneDetailScreen(
                 runCatching { client.capture(paneId, lines = CAPTURE_LINES) }
                     .onSuccess { lines = it.lines }
                     .onFailure { error = it.message }
+            }
+            // Long-running consumer that drains the conflated channel and
+            // fires fetches serially with a 200ms debounce. Lives inside
+            // this scope so it's torn down with the outer LaunchedEffect.
+            val refetchConsumer = scope.launch {
+                for (@Suppress("UNUSED_VARIABLE") signal in refetchChannel) {
+                    // No artificial delay — the CONFLATED channel already
+                    // coalesces rapid-fire events and the server responds
+                    // in ~50ms. Adding a debounce delay was the difference
+                    // between "instant" (initial load, direct call) and
+                    // "noticeably laggy" (subsequent event-driven refetches).
+                    refetchCapture()
+                }
             }
             try {
                 refetchCapture()
@@ -269,13 +303,10 @@ fun PaneDetailScreen(
                         }
                         is EventDto.PaneOutputChanged -> {
                             if (ev.paneId == paneId) {
-                                // Capture: fast, debounced 250ms so a burst
-                                // of status-bar ticks collapses into one fetch.
-                                refetchJob?.cancel()
-                                refetchJob = scope.launch {
-                                    kotlinx.coroutines.delay(250)
-                                    refetchCapture()
-                                }
+                                // Signal the conflated channel; the consumer
+                                // coalesces bursts into single fetches and
+                                // never cancels in-flight HTTP calls.
+                                refetchChannel.trySend(Unit)
                             }
                         }
                         is EventDto.ApprovalCreated -> {
@@ -292,13 +323,13 @@ fun PaneDetailScreen(
                     }
                 }
             } catch (t: kotlinx.coroutines.CancellationException) {
-                refetchJob?.cancel()
+                refetchConsumer.cancel()
                 runCatching { client.close() }
                 throw t
             } catch (t: Throwable) {
                 error = t.message ?: t::class.simpleName
             } finally {
-                refetchJob?.cancel()
+                refetchConsumer.cancel()
                 runCatching { client.close() }
             }
             kotlinx.coroutines.delay(backoff)
@@ -389,13 +420,32 @@ fun PaneDetailScreen(
         }
     }
 
-    fun cycleMode() {
+    // Walk Claude's shift-tab cycle one step at a time until the detected
+    // mode matches the target. We don't hardcode the cycle order because it
+    // has shifted across Claude Code versions (a previous dropdown that
+    // assumed {Normal, AutoAccept, Plan, Bypass} landed on the wrong mode).
+    // Bail if detection doesn't move within the timeout — either we already
+    // hit target or the pane output isn't flowing; either way, hammering
+    // more S-Tabs won't help.
+    fun setMode(target: ClaudeMode) {
         scope.launch {
             val cfg = config ?: return@launch
             val c = CompanionClient(cfg.baseUrl, cfg.bearerToken)
-            runCatching { c.sendKey(paneId, "S-Tab") }
-                .onFailure { error = it.message }
-            c.close()
+            try {
+                repeat(ClaudeMode.entries.size) {
+                    val before = detectClaudeMode(lines)
+                    if (before == target) return@launch
+                    c.sendKey(paneId, "S-Tab")
+                    val settled = withTimeoutOrNull(1500) {
+                        snapshotFlow { detectClaudeMode(lines) }.first { it != before }
+                    }
+                    if (settled == null) return@launch
+                }
+            } catch (t: Throwable) {
+                error = t.message
+            } finally {
+                c.close()
+            }
         }
     }
 
@@ -517,12 +567,15 @@ fun PaneDetailScreen(
                 },
                 actions = {
                     contextPct?.let { ContextChip(pct = it) }
-                    // One tap = one Shift-Tab. Multi-step dropdown looked right
-                    // but shipped wrong: Claude Code's actual cycle order isn't
-                    // {Normal, AutoAccept, Plan, Bypass} so the computed jump
-                    // count would land on the wrong mode. Cycling one step per
-                    // tap is short and correct.
-                    ModeChip(mode = claudeMode, onClick = { cycleMode() })
+                    ModeChip(
+                        mode = claudeMode,
+                        expanded = showModeMenu,
+                        onToggle = { showModeMenu = !showModeMenu },
+                        onSelect = { target ->
+                            showModeMenu = false
+                            setMode(target)
+                        },
+                    )
                     EffortChip(
                         current = currentEffort,
                         expanded = showEffortMenu,
@@ -1153,28 +1206,52 @@ private fun FloatingQuickKeys(
     }
 }
 
+/**
+ * Mode picker — pill showing the currently-detected mode with a dropdown
+ * listing all four. The current mode is marked with `• `. Selecting an
+ * item invokes `onSelect`, which the caller wires to a closed-loop setter
+ * that walks Claude's shift-tab cycle until the target is reached.
+ */
 @Composable
-private fun ModeChip(mode: ClaudeMode, onClick: () -> Unit) {
+private fun ModeChip(
+    mode: ClaudeMode,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onSelect: (ClaudeMode) -> Unit,
+) {
     val color = when (mode) {
         ClaudeMode.Normal     -> StatusColors.Idle
         ClaudeMode.AutoAccept -> StatusColors.Running
         ClaudeMode.Plan       -> StatusColors.Done
         ClaudeMode.Bypass     -> Color(0xFFFF6B6B)
     }
-    Row(
-        modifier = Modifier
-            .padding(end = 2.dp)
-            .clip(RoundedCornerShape(999.dp))
-            .background(color.copy(alpha = 0.14f))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = mode.label,
-            style = MaterialTheme.typography.labelSmall,
-            color = color,
-        )
+    Box(modifier = Modifier.padding(end = 2.dp)) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(color.copy(alpha = 0.14f))
+                .clickable(onClick = onToggle)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = mode.label,
+                style = MaterialTheme.typography.labelSmall,
+                color = color,
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = onToggle,
+        ) {
+            ClaudeMode.entries.forEach { option ->
+                val marker = if (option == mode) "• " else "  "
+                DropdownMenuItem(
+                    text = { Text("$marker${option.label}") },
+                    onClick = { onSelect(option) },
+                )
+            }
+        }
     }
 }
 
