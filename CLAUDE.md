@@ -34,7 +34,7 @@ app/src/main/java/com/andreacanes/panemgmt/
 │   └── models/Dtos.kt              @Serializable mirrors of Rust companion DTOs
 ├── ui/
 │   ├── setup/SetupScreen.kt        URL + bearer form, test + save
-│   ├── grid/PaneGridScreen.kt      LazyColumn of pane cards, live via WebSocket
+│   ├── grid/PaneGridScreen.kt      TabRow (Active / Waiting / Idle / All) + HorizontalPager + PullToRefreshBox, live via WebSocket
 │   └── detail/PaneDetailScreen.kt  capture + input + mic + approval dialog
 └── voice/VoiceInputController.kt   SpeechRecognizer wrapper, offline preferred
 ```
