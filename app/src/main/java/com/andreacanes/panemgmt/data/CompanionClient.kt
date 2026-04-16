@@ -199,6 +199,13 @@ class CompanionClient(
     suspend fun rateLimits(): List<AccountRateLimitDto> =
         client.get("/api/v1/rate-limits").body()
 
+    /** Recent notification audit log entries for debugging. */
+    suspend fun auditLog(limit: Int = 100, sinceMs: Long? = null): List<kotlinx.serialization.json.JsonElement> =
+        client.get("/api/v1/audit") {
+            parameter("limit", limit)
+            if (sinceMs != null) parameter("since_ms", sinceMs)
+        }.body()
+
     suspend fun resolveApproval(id: String, decision: Decision, reason: String? = null) {
         client.post("/api/v1/approvals/$id") {
             contentType(ContentType.Application.Json)

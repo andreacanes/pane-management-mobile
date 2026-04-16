@@ -75,7 +75,7 @@ class ApprovalService : Service() {
             return
         }
 
-        // approvalId (uuid string) → notification id, so we can cancel when
+            // approvalId (uuid string) → notification id, so we can cancel when
         // the approval resolves from the desktop side.
         val openApprovals = mutableMapOf<String, Int>()
         // paneId → attention notification id, so PaneStateChanged can cancel.
@@ -83,6 +83,8 @@ class ApprovalService : Service() {
         // Maps paneId → list of approval UUIDs for that pane, so viewing a
         // pane can cancel all its approval notifications at once.
         val approvalsByPane = mutableMapOf<String, MutableList<String>>()
+        // Per-pane cooldown for "info" kind attention events (30s).
+        val lastInfoNotifTime = mutableMapOf<String, Long>()
 
         // Cancel notifications when the user views a pane in the app.
         val viewedPaneJob = scope.launch {
@@ -119,6 +121,16 @@ class ApprovalService : Service() {
                             )
                         }
                         is EventDto.AttentionNeeded -> {
+                            // Defense-in-depth cooldown: suppress "info" kind
+                            // (Stop hook) notifications within 30 s per pane.
+                            if (ev.kind == "info") {
+                                val now = System.currentTimeMillis()
+                                val prev = lastInfoNotifTime[ev.paneId] ?: 0L
+                                if (now - prev < 30_000L) {
+                                    return@collect
+                                }
+                                lastInfoNotifTime[ev.paneId] = now
+                            }
                             // Reuse the same notifId for the same pane so a
                             // second attention event for the same pane updates
                             // the existing notification instead of stacking.
@@ -179,6 +191,25 @@ class ApprovalService : Service() {
                                         paneId = approval.paneId,
                                         title = "${prefix}Claude: ${approval.title}",
                                         body = approval.message.ifBlank { "Approval requested" },
+                                    )
+                                }
+                            }
+                            // Replay active attention notifications so they
+                            // survive WebSocket reconnects.
+                            ev.attention.forEach { attn ->
+                                if (!openAttention.containsKey(attn.paneId)) {
+                                    val notifId = nextNotifId.getAndIncrement()
+                                    openAttention[attn.paneId] = notifId
+                                    val channel = if (attn.kind == "input")
+                                        NotificationChannels.ATTENTION_INPUT
+                                    else
+                                        NotificationChannels.ATTENTION_INFO
+                                    postAttentionNotification(
+                                        notifId = notifId,
+                                        paneId = attn.paneId,
+                                        title = attn.title,
+                                        body = attn.message,
+                                        channel = channel,
                                     )
                                 }
                             }

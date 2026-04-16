@@ -100,7 +100,6 @@ import com.andreacanes.panemgmt.ViewedPaneBus
 import com.andreacanes.panemgmt.data.AuthStore
 import com.andreacanes.panemgmt.data.CompanionClient
 import com.andreacanes.panemgmt.data.models.ApprovalDto
-import com.andreacanes.panemgmt.data.models.ConversationMessageDto
 import com.andreacanes.panemgmt.data.models.Decision
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.ImageItemDto
@@ -114,9 +113,9 @@ import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 
-// Capture only grabs the live terminal frame now — the JSONL
-// transcript (via /conversation) provides real scrollback.
-private const val CAPTURE_LINES = 200
+// 0 = "all scrollback" — the companion translates this to tmux
+// `capture-pane -S -` which grabs the full history buffer.
+private const val CAPTURE_LINES = 0
 
 /**
  * Incremental line-cleaning cache. Keeps a map from raw line → parsed
@@ -155,12 +154,6 @@ fun PaneDetailScreen(
     val scope = rememberCoroutineScope()
 
     var lines by remember { mutableStateOf<List<String>>(emptyList()) }
-    // Parsed JSONL transcript (full session history). Claude Code writes
-    // one record per message into ~/.claude/projects/<cwd>/<sid>.jsonl,
-    // so this is the only source of scrollback that survives the TUI's
-    // in-place redraws. The live `/capture` result is overlaid after it
-    // for the in-flight turn.
-    var transcriptMessages by remember { mutableStateOf<List<ConversationMessageDto>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
     var inputText by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
@@ -241,7 +234,6 @@ fun PaneDetailScreen(
     LaunchedEffect(config, paneId) {
         val cfg = config ?: return@LaunchedEffect
         var refetchJob: kotlinx.coroutines.Job? = null
-        var transcriptJob: kotlinx.coroutines.Job? = null
         var backoff = 1_000L
         while (true) {
             val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
@@ -250,17 +242,8 @@ fun PaneDetailScreen(
                     .onSuccess { lines = it.lines }
                     .onFailure { error = it.message }
             }
-            suspend fun refetchTranscript() {
-                // 404 is expected on panes that haven't produced a JSONL
-                // yet (no session bound, or `cld` still sitting at its
-                // splash). Silently leave the transcript empty in that
-                // case — the capture overlay will still render.
-                runCatching { client.conversation(paneId) }
-                    .onSuccess { transcriptMessages = it.messages }
-            }
             try {
                 refetchCapture()
-                refetchTranscript()
                 approvals = client.listApprovals().filter { it.paneId == paneId }
                 val allPanes = runCatching { client.listPanes() }.getOrDefault(emptyList())
                 paneInfo = allPanes.firstOrNull { it.id == paneId }
@@ -293,15 +276,6 @@ fun PaneDetailScreen(
                                     kotlinx.coroutines.delay(250)
                                     refetchCapture()
                                 }
-                                // Transcript: JSONL only grows after Claude
-                                // flushes a turn — polling faster than ~2s
-                                // would just re-read the same file.
-                                if (transcriptJob?.isActive != true) {
-                                    transcriptJob = scope.launch {
-                                        kotlinx.coroutines.delay(2_000)
-                                        refetchTranscript()
-                                    }
-                                }
                             }
                         }
                         is EventDto.ApprovalCreated -> {
@@ -319,14 +293,12 @@ fun PaneDetailScreen(
                 }
             } catch (t: kotlinx.coroutines.CancellationException) {
                 refetchJob?.cancel()
-                transcriptJob?.cancel()
                 runCatching { client.close() }
                 throw t
             } catch (t: Throwable) {
                 error = t.message ?: t::class.simpleName
             } finally {
                 refetchJob?.cancel()
-                transcriptJob?.cancel()
                 runCatching { client.close() }
             }
             kotlinx.coroutines.delay(backoff)
@@ -342,42 +314,19 @@ fun PaneDetailScreen(
     val lineCache = remember { LineCache() }
     // Transcript (full JSONL history) sits above the live capture overlay
     // with a dim separator. The capture reflects what Claude is drawing
-    // right now — useful while a response is streaming and hasn't yet
-    // been flushed to JSONL. Some duplication at the boundary is tolerated.
-    val transcriptRawLines = remember(transcriptMessages) {
-        renderTranscriptLines(transcriptMessages)
-    }
-    val mergedRawLines = remember(transcriptRawLines, lines) {
-        if (transcriptRawLines.isEmpty()) {
-            lines
-        } else if (lines.isEmpty()) {
-            transcriptRawLines
-        } else {
-            transcriptRawLines + LIVE_OVERLAY_SEPARATOR + lines
-        }
-    }
-    val cleaned = remember(mergedRawLines, onSurface) {
-        cleanOutputLines(mergedRawLines, onSurface, lineCache)
+    // tmux scrollback is the sole content source — no JSONL reconstruction.
+    val cleaned = remember(lines, onSurface) {
+        cleanOutputLines(lines, onSurface, lineCache)
     }
     val displayLines = cleaned.lines
     val contextPct = cleaned.contextPct
-    // Mode is a TUI status-line thing — only readable from live capture.
     val claudeMode = remember(lines) { detectClaudeMode(lines) }
-    // Effort is a per-session setting. Try live capture first (for the
-    // just-set case where the status line still shows "effort: …"), then
-    // fall back to scanning the JSONL transcript for the last `/effort`
-    // slash command the user sent. That makes the chip reflect the
-    // session's actual inherited level after a resume, not "—".
     val detectedEffort = remember(lines) { detectEffort(lines) }
-    val transcriptEffort = remember(transcriptMessages) {
-        detectEffortInTranscript(transcriptMessages)
-    }
     var lastKnownEffort by remember(paneId) { mutableStateOf<String?>(null) }
-    LaunchedEffect(detectedEffort, transcriptEffort) {
-        val found = detectedEffort ?: transcriptEffort
-        if (found != null) {
-            lastKnownEffort = found
-            if (found == pendingEffort) pendingEffort = null
+    LaunchedEffect(detectedEffort) {
+        if (detectedEffort != null) {
+            lastKnownEffort = detectedEffort
+            if (detectedEffort == pendingEffort) pendingEffort = null
         }
     }
     val currentEffort = pendingEffort ?: lastKnownEffort
@@ -712,8 +661,11 @@ fun PaneDetailScreen(
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
                             start = 12.dp,
                             top = 12.dp,
-                            // Reserve the right gutter for the floating key column.
-                            end = 60.dp,
+                            // Use the full pane width — the floating key
+                            // column is a semi-transparent overlay, not a
+                            // blocker. A tiny right margin keeps glyphs off
+                            // the very edge.
+                            end = 12.dp,
                             bottom = 12.dp,
                         ),
                     ) {
@@ -1070,21 +1022,6 @@ internal fun detectEffort(lines: List<String>): String? {
 }
 
 /**
- * Scan the JSONL transcript for the most recent `/effort <level>` slash
- * command a user ran. Gives the effort chip something to display after
- * a session resume where the live TUI no longer echoes the command.
- */
-internal fun detectEffortInTranscript(messages: List<ConversationMessageDto>): String? {
-    val pat = Regex("""/effort\s+(low|medium|high|max)\b""", RegexOption.IGNORE_CASE)
-    for (msg in messages.asReversed()) {
-        if (msg.role != "user") continue
-        val m = pat.find(msg.text) ?: continue
-        return m.groupValues[1].lowercase()
-    }
-    return null
-}
-
-/**
  * Strip pure-visual lines (Unicode box drawing, shading, full-block) from
  * Claude's captured terminal output and collapse runs of empty / visual-only
  * lines into a single blank entry. Also drops lines that contain a long
@@ -1150,87 +1087,6 @@ private fun cleanOutputLines(raw: List<String>, defaultColor: Color, cache: Line
     // refetch) hit the cache and skip all ANSI/regex work.
     val parsed = out.map { line -> cache.getOrParse(line, defaultColor) }
     return CleanedOutput(parsed, contextPct)
-}
-
-// Visual delimiter between the JSONL transcript above and the live
-// /capture output below. Uses box-drawing dashes (short enough not to
-// trip `LONG_DASH_RUN`) and a dim grey colour so it looks like chrome,
-// not chat content.
-private val LIVE_OVERLAY_SEPARATOR: List<String> = listOf(
-    "",
-    "\u001B[2;90m───── live terminal ─────\u001B[0m",
-    "",
-)
-
-/**
- * Flatten parsed conversation messages into raw ANSI-styled lines that
- * feed the same rendering pipeline as `/capture`. User prompts get a
- * cyan `❯`; assistant text stays default colour; tool invocations get a
- * green `⏺` followed by the tool name and a short argument summary.
- * Splitting on newline inside a message preserves code blocks and
- * multi-line prompts verbatim.
- */
-private fun renderTranscriptLines(messages: List<ConversationMessageDto>): List<String> {
-    if (messages.isEmpty()) return emptyList()
-    val out = mutableListOf<String>()
-    for (msg in messages) {
-        when (msg.role) {
-            "user" -> {
-                if (out.isNotEmpty()) out.add("")
-                val textLines = msg.text.split('\n')
-                val first = textLines.firstOrNull().orEmpty()
-                out.add("\u001B[1;36m❯\u001B[0m \u001B[1m$first\u001B[0m")
-                textLines.drop(1).forEach { line -> out.add("  $line") }
-            }
-            "assistant" -> {
-                if (out.isNotEmpty()) out.add("")
-                if (msg.text.isNotBlank()) {
-                    msg.text.split('\n').forEach { out.add(it) }
-                }
-                val toolName = msg.toolName
-                if (toolName != null) {
-                    val summary = summarizeToolUse(toolName, msg.toolInput)
-                    val header = buildString {
-                        append("\u001B[32m⏺\u001B[0m \u001B[1m")
-                        append(toolName)
-                        append("\u001B[0m")
-                        if (summary.isNotEmpty()) append("(").append(summary).append(")")
-                    }
-                    if (msg.text.isNotBlank()) out.add("")
-                    out.add(header)
-                }
-            }
-        }
-    }
-    return out
-}
-
-/**
- * Produce a one-line argument summary for a tool_use block — Bash gets
- * the first line of its command, file tools the basename, etc. Mirrors
- * what Claude would have printed inline in the terminal without
- * re-implementing its full tool-card formatting.
- */
-private fun summarizeToolUse(toolName: String, input: JsonElement?): String {
-    val obj = input as? kotlinx.serialization.json.JsonObject ?: return ""
-    fun str(key: String): String? {
-        val el = obj[key] ?: return null
-        if (el is kotlinx.serialization.json.JsonNull) return null
-        val prim = el as? kotlinx.serialization.json.JsonPrimitive ?: return null
-        return prim.content
-    }
-    return when (toolName) {
-        "Bash" -> str("command")?.split('\n')?.firstOrNull()?.take(120).orEmpty()
-        "Edit", "Write", "MultiEdit", "Read",
-        "NotebookEdit", "NotebookRead" -> str("file_path")?.substringAfterLast('/').orEmpty()
-        "Grep" -> str("pattern")?.take(60).orEmpty()
-        "Glob" -> str("pattern").orEmpty()
-        "WebFetch" -> str("url").orEmpty()
-        "WebSearch" -> str("query")?.take(60).orEmpty()
-        "Task", "Agent" -> str("description") ?: str("subagent_type").orEmpty()
-        "TodoWrite" -> "…"
-        else -> ""
-    }
 }
 
 @OptIn(ExperimentalSerializationApi::class)

@@ -117,6 +117,15 @@ fun parseAnsiLine(raw: String, defaultColor: Color): AnnotatedString = buildAnno
                 pushStyle(state.toSpanStyle(defaultColor))
             }
             // All other CSI sequences (cursor movement, etc.) are silently dropped
+        } else if (c == '\u001B' && i + 1 < len && raw[i + 1] == ']') {
+            // OSC sequence: \x1b] ... (terminated by ST = \x1b\\ or BEL = \x07)
+            // Used for hyperlinks (OSC 8), window titles, etc. Consume entirely.
+            i += 2
+            while (i < len) {
+                if (raw[i] == '\u0007') { i++; break }                         // BEL terminator
+                if (raw[i] == '\u001B' && i + 1 < len && raw[i + 1] == '\\') { i += 2; break } // ST terminator
+                i++
+            }
         } else if (c == '\r') {
             // Strip carriage returns
             i++
@@ -139,9 +148,18 @@ fun stripAnsi(s: String): String {
     while (i < len) {
         val c = s[i]
         if (c == '\u001B' && i + 1 < len && s[i + 1] == '[') {
+            // CSI sequence
             i += 2
             while (i < len && s[i].code in 0x20..0x3F) i++
             if (i < len) i++ // skip final byte
+        } else if (c == '\u001B' && i + 1 < len && s[i + 1] == ']') {
+            // OSC sequence (hyperlinks, window title, etc.)
+            i += 2
+            while (i < len) {
+                if (s[i] == '\u0007') { i++; break }
+                if (s[i] == '\u001B' && i + 1 < len && s[i + 1] == '\\') { i += 2; break }
+                i++
+            }
         } else if (c != '\r') {
             out.append(c)
             i++

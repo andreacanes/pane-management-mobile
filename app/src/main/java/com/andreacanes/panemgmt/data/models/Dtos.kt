@@ -222,12 +222,26 @@ data class ConversationMessageDto(
     val timestamp: String,
     @SerialName("tool_name") val toolName: String? = null,
     @SerialName("tool_input") val toolInput: JsonElement? = null,
+    val thinking: String? = null,
+    @SerialName("tool_result") val toolResult: String? = null,
+    @SerialName("tool_result_truncated") val toolResultTruncated: Boolean? = null,
+    @SerialName("tool_result_error") val toolResultError: Boolean? = null,
 )
 
 @Serializable
 data class ConversationResponseDto(
     @SerialName("session_id") val sessionId: String,
     val messages: List<ConversationMessageDto>,
+)
+
+/** Snapshot of an active attention notification, replayed on WS reconnect. */
+@Serializable
+data class AttentionSnapshotDto(
+    @SerialName("pane_id") val paneId: String,
+    val title: String,
+    val message: String,
+    val kind: String = "input",
+    val at: Long,
 )
 
 /**
@@ -241,6 +255,7 @@ sealed class EventDto {
     data class Snapshot(
         val panes: List<PaneDto>,
         val approvals: List<ApprovalDto>,
+        val attention: List<AttentionSnapshotDto> = emptyList(),
     ) : EventDto()
 
     @Serializable
