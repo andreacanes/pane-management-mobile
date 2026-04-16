@@ -16,23 +16,32 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.andreacanes.panemgmt.data.models.PaneState
+import com.andreacanes.panemgmt.data.models.WaitingReason
 import com.andreacanes.panemgmt.ui.theme.paneStateColor
 
 /**
  * Unified status chip for a pane state — used on the grid card and the
  * detail header. A small colored dot followed by a semantic label.
+ *
+ * When [state] is [PaneState.Waiting], [waitingReason] selects between
+ * "Needs decision" (Request — amber) and "Nudge" (Continue — soft blue).
  */
 @Composable
 fun StatusChip(
     state: PaneState,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
+    waitingReason: WaitingReason? = null,
 ) {
-    val color = paneStateColor(state)
+    val color = paneStateColor(state, waitingReason)
     val label = when (state) {
         PaneState.Idle    -> "Idle"
         PaneState.Running -> "Running"
-        PaneState.Waiting -> "Waiting"
+        PaneState.Waiting -> when (waitingReason) {
+            WaitingReason.Continue -> "Nudge"
+            WaitingReason.Request  -> "Needs decision"
+            null                   -> "Waiting"
+        }
         PaneState.Done    -> "Done"
     }
     val bg = color.copy(alpha = 0.14f)

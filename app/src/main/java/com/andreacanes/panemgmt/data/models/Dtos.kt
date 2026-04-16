@@ -26,6 +26,21 @@ enum class PaneState {
     Done,
 }
 
+/** Sub-category of [PaneState.Waiting]. Carried as `waiting_reason` on
+ *  the wire and absent when the pane is not waiting. */
+@Serializable
+enum class WaitingReason {
+    /** Claude asked something (permission, elicitation, AskUserQuestion,
+     *  idle_prompt). User needs to make a decision. */
+    @SerialName("request")
+    Request,
+
+    /** Claude finished a turn (Stop hook) and is waiting for the user
+     *  to nudge with the next prompt. Not a Claude-initiated request. */
+    @SerialName("continue")
+    Continue,
+}
+
 @Serializable
 data class PaneDto(
     val id: String,
@@ -36,6 +51,10 @@ data class PaneDto(
     @SerialName("current_command") val currentCommand: String,
     @SerialName("current_path") val currentPath: String,
     val state: PaneState,
+    /** Sub-category when [state] is [PaneState.Waiting]. `Request` when
+     *  Claude is asking something; `Continue` when Claude stopped and
+     *  wants a user nudge. Null for all other states. */
+    @SerialName("waiting_reason") val waitingReason: WaitingReason? = null,
     @SerialName("last_output_preview") val lastOutputPreview: List<String>,
     @SerialName("project_encoded_name") val projectEncodedName: String? = null,
     @SerialName("project_display_name") val projectDisplayName: String? = null,

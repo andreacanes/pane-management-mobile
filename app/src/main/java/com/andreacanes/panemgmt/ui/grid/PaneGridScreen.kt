@@ -72,6 +72,7 @@ import com.andreacanes.panemgmt.data.models.ApprovalDto
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.PaneDto
 import com.andreacanes.panemgmt.data.models.PaneState
+import com.andreacanes.panemgmt.data.models.WaitingReason
 import com.andreacanes.panemgmt.data.models.UsageDto
 import com.andreacanes.panemgmt.service.ApprovalService
 import com.andreacanes.panemgmt.ui.common.StatusChip
@@ -351,9 +352,20 @@ fun PaneGridScreen(
     }
     val allCount = panes.size
 
+    // Request-flavored waiting (approvals, questions) should surface above
+    // Continue-flavored waiting (Claude just stopped). 0 sorts first.
+    fun waitingPriority(p: PaneDto): Int =
+        if (approvalPaneIds.contains(p.id)) 0
+        else when (p.waitingReason) {
+            WaitingReason.Request  -> 0
+            null                   -> 1
+            WaitingReason.Continue -> 2
+        }
+
     fun panesForTab(tab: GridTab): List<PaneDto> = when (tab) {
         GridTab.Active  -> panes.filter { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
         GridTab.Waiting -> panes.filter { isWaiting(it) }
+            .sortedBy { waitingPriority(it) }
         GridTab.Stashed -> panes.filter { isStashed(it) }
             .sortedBy { lastActivity(it) } // oldest first — most "stashed" at top
         GridTab.All     -> panes
@@ -903,7 +915,12 @@ private fun PaneCard(
                     AccountPill(account = it)
                 }
                 Spacer(Modifier.width(8.dp))
-                StatusChip(state = effectiveState, compact = true)
+                // Approvals always map to Request; otherwise use the server
+                // reason. Non-Waiting states carry no reason.
+                val effectiveReason = if (effectiveState == PaneState.Waiting) {
+                    if (hasApproval) WaitingReason.Request else pane.waitingReason
+                } else null
+                StatusChip(state = effectiveState, compact = true, waitingReason = effectiveReason)
             }
             Spacer(Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
