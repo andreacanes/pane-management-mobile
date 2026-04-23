@@ -63,6 +63,10 @@ data class PaneDto(
      *  env (`CLAUDE_CONFIG_DIR`) on local panes, synthesized from pane
      *  assignment on remote (Mac) panes. */
     @SerialName("claude_account") val claudeAccount: String? = null,
+    /** Which host the pane lives on: "local" (WSL on the desktop) or an
+     *  SSH alias such as "mac". Null on servers predating the Mac-host
+     *  integration — treat as "local". */
+    @SerialName("host") val host: String? = null,
     /** Current `/effort` level ("low" | "medium" | "high" | "max") detected
      *  by the companion poller from the pane's terminal output. Null when
      *  detection hasn't fired yet (fresh pane, or banner scrolled off before

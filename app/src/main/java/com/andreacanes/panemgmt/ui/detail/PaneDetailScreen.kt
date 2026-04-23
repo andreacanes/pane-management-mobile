@@ -555,13 +555,15 @@ fun PaneDetailScreen(
         }
     }
 
-    /** Stop Claude and restart with the other account's launcher. andrea
-     *  → ncld2, bravura → ncld. Appends --resume <uuid> when we know the
-     *  session id so the conversation carries over. */
+    /** Stop Claude and restart under the next account in the cycle.
+     *  andrea → bravura → sully → andrea. Each step uses that account's
+     *  launcher alias (ncld / ncld2 / ncld3) so the in-pane Claude
+     *  picks up the right CLAUDE_CONFIG_DIR. Appends --resume <uuid>
+     *  when a session id is known so the conversation carries over. */
     fun switchAccount() {
         val info = paneInfo ?: return
         val currentAcct = info.claudeAccount ?: "andrea"
-        val targetCmd = if (currentAcct == "bravura") "ncld" else "ncld2"
+        val (targetCmd, _) = nextAccountAfter(currentAcct)
         val resumeFlag = info.claudeSessionId?.let { " --resume $it" } ?: ""
         switching = true
         scope.launch {
@@ -652,15 +654,30 @@ fun PaneDetailScreen(
                             setEffort(level)
                         },
                     )
-                    // Account switch: stop + restart with the other account's
-                    // launcher, carrying --resume when we know the session id.
+                    // Account switch: stop + restart cycling through the
+                    // known accounts (andrea → bravura → sully → andrea),
+                    // carrying --resume when we know the session id.
                     if (paneInfo?.claudeAccount != null) {
                         val acct = paneInfo?.claudeAccount ?: "andrea"
-                        val targetLabel = if (acct == "bravura") "A" else "B"
-                        val acctColor = if (acct == "bravura")
-                            Color(0xFF60A5FA) // switch TO andrea = blue
-                        else
-                            Color(0xFFA78BFA) // switch TO bravura = purple
+                        val (_, nextAcctKey) = nextAccountAfter(acct)
+                        val targetLabel = when (nextAcctKey) {
+                            "andrea" -> "A"
+                            "bravura" -> "B"
+                            "sully" -> "S"
+                            else -> "?"
+                        }
+                        val acctColor = when (nextAcctKey) {
+                            "andrea" -> Color(0xFF60A5FA)  // blue
+                            "bravura" -> Color(0xFFA78BFA) // purple
+                            "sully" -> Color(0xFF14B8A6)   // teal
+                            else -> Color(0xFF888888)
+                        }
+                        val nextLabel = when (nextAcctKey) {
+                            "andrea" -> "Andrea"
+                            "bravura" -> "Bravura"
+                            "sully" -> "Sully"
+                            else -> nextAcctKey
+                        }
                         IconButton(
                             onClick = { switchAccount() },
                             enabled = !switching,
@@ -669,7 +686,7 @@ fun PaneDetailScreen(
                             Box(contentAlignment = Alignment.Center) {
                                 Icon(
                                     Icons.Default.SwapHoriz,
-                                    contentDescription = "Switch to ${if (acct == "bravura") "Andrea" else "Bravura"}",
+                                    contentDescription = "Switch to $nextLabel",
                                     tint = acctColor,
                                     modifier = Modifier.size(20.dp),
                                 )
@@ -1301,6 +1318,20 @@ private fun paneProjectLabel(encoded: String?): String? {
     val decoded = encoded.replace("-", "/").trimEnd('/')
     val last = decoded.substringAfterLast('/')
     return last.ifBlank { encoded }
+}
+
+/**
+ * Given a current account identity (`"andrea"` / `"bravura"` / `"sully"`),
+ * return `(targetLauncherCmd, nextAcctKey)` for the next step of the
+ * andrea → bravura → sully cycle. The launcher cmd matches the WSL
+ * shell functions in `~/.bashrc` (`ncld`, `ncld2`, `ncld3`) so the new
+ * Claude run picks up the right `CLAUDE_CONFIG_DIR`.
+ */
+private fun nextAccountAfter(current: String): Pair<String, String> = when (current) {
+    "andrea" -> Pair("ncld2", "bravura")
+    "bravura" -> Pair("ncld3", "sully")
+    "sully" -> Pair("ncld", "andrea")
+    else -> Pair("ncld2", "bravura")
 }
 
 /**
