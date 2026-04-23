@@ -580,9 +580,9 @@ private fun RateLimitChip(rl: AccountRateLimitDto) {
                 .clip(RoundedCornerShape(8.dp))
                 .background(acctColor.copy(alpha = 0.10f))
                 .clickable { showDetail = true }
-                .padding(horizontal = 6.dp, vertical = 2.dp),
+                .padding(horizontal = 5.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
         ) {
             // Account initial
             Text(
@@ -728,25 +728,31 @@ private fun RateLimitRow(
     resetsAt: Long?,
     color: Color,
 ) {
+    // `resetsAt` retained for API-shape stability and the detail popup;
+    // the inline countdown was dropped when sully made three chips race
+    // for horizontal space in the TopAppBar.
+    @Suppress("UNUSED_PARAMETER")
+    resetsAt
     val pctInt = pct.toInt().coerceIn(0, 100)
     val filledSegments = (pctInt + 19) / 20  // 5 segments, 20% each, round up
-    val countdown = fmtCountdown(resetsAt)
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall.copy(fontSize = 8.sp),
             color = color.copy(alpha = 0.6f),
         )
-        // 5-segment mini bar
+        // 5-segment mini bar — 4dp segments (down from 5) save 5dp per
+        // row × 2 rows × 3 chips = 30dp, enough for the third chip to
+        // fit beside the `+` / logout icons.
         Row(horizontalArrangement = Arrangement.spacedBy(1.dp)) {
             repeat(5) { i ->
                 Box(
                     modifier = Modifier
-                        .size(width = 5.dp, height = 7.dp)
+                        .size(width = 4.dp, height = 7.dp)
                         .clip(RoundedCornerShape(1.dp))
                         .background(
                             if (i < filledSegments) color
@@ -756,19 +762,11 @@ private fun RateLimitRow(
             }
         }
         Text(
-            text = "$pctInt%",
+            text = "$pctInt",
             style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
             color = color,
             fontFamily = FontFamily.Monospace,
         )
-        if (countdown.isNotEmpty()) {
-            Text(
-                text = countdown,
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
-                color = color.copy(alpha = 0.6f),
-                fontFamily = FontFamily.Monospace,
-            )
-        }
     }
 }
 
