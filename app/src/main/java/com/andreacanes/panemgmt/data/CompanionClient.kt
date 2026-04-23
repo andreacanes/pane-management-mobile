@@ -58,6 +58,17 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.net.URLEncoder
+
+/**
+ * Percent-encode a pane id for safe inclusion in a URL path segment.
+ * Local pane ids (`<session>:<window>.<pane>`) round-trip cleanly;
+ * remote pane ids carry a `<alias>/` prefix (e.g. `mac/akamai:0.0`)
+ * whose literal `/` would otherwise split path segments and 404 at
+ * Axum routing. URLEncoder handles `/` → `%2F`, `:` → `%3A`, etc.
+ */
+private fun encPaneId(id: String): String =
+    URLEncoder.encode(id, Charsets.UTF_8.name())
 
 /**
  * Ktor client for the pane-management companion service.
@@ -126,7 +137,7 @@ class CompanionClient(
         }.body()
 
     suspend fun capture(paneId: String, lines: Int = 1000): CaptureDto =
-        client.get("/api/v1/panes/$paneId/capture") {
+        client.get("/api/v1/panes/${encPaneId(paneId)}/capture") {
             parameter("lines", lines)
         }.body()
 
@@ -137,19 +148,19 @@ class CompanionClient(
      * back to [capture].
      */
     suspend fun conversation(paneId: String, after: String? = null): ConversationResponseDto =
-        client.get("/api/v1/panes/$paneId/conversation") {
+        client.get("/api/v1/panes/${encPaneId(paneId)}/conversation") {
             if (after != null) parameter("after", after)
         }.body()
 
     suspend fun sendInput(paneId: String, text: String, submit: Boolean = true) {
-        client.post("/api/v1/panes/$paneId/input") {
+        client.post("/api/v1/panes/${encPaneId(paneId)}/input") {
             contentType(ContentType.Application.Json)
             setBody(SendInputRequest(text = text, submit = submit))
         }
     }
 
     suspend fun sendVoice(paneId: String, transcript: String, locale: String? = null) {
-        client.post("/api/v1/panes/$paneId/voice") {
+        client.post("/api/v1/panes/${encPaneId(paneId)}/voice") {
             contentType(ContentType.Application.Json)
             setBody(SendVoiceRequest(transcript = transcript, submit = true, locale = locale))
         }
@@ -166,7 +177,7 @@ class CompanionClient(
         images: List<ImageItemDto>,
         prompt: String? = null,
     ) {
-        client.post("/api/v1/panes/$paneId/image") {
+        client.post("/api/v1/panes/${encPaneId(paneId)}/image") {
             contentType(ContentType.Application.Json)
             setBody(SendImageRequest(images = images, prompt = prompt))
         }
@@ -179,14 +190,14 @@ class CompanionClient(
      * shift Claude between Normal / Auto-Accept / Plan / Bypass.
      */
     suspend fun sendKey(paneId: String, key: String) {
-        client.post("/api/v1/panes/$paneId/key") {
+        client.post("/api/v1/panes/${encPaneId(paneId)}/key") {
             contentType(ContentType.Application.Json)
             setBody(SendKeyRequest(key = key))
         }
     }
 
     suspend fun cancelPane(paneId: String) {
-        client.post("/api/v1/panes/$paneId/cancel")
+        client.post("/api/v1/panes/${encPaneId(paneId)}/cancel")
     }
 
     suspend fun listApprovals(): List<ApprovalDto> =
@@ -246,7 +257,7 @@ class CompanionClient(
      * Returns 204 on success.
      */
     suspend fun killPane(paneId: String) {
-        client.delete("/api/v1/panes/$paneId")
+        client.delete("/api/v1/panes/${encPaneId(paneId)}")
     }
 
     /**
@@ -276,7 +287,7 @@ class CompanionClient(
         paneId: String,
         account: String,
     ): CreatePaneResponse =
-        client.post("/api/v1/panes/$paneId/fork") {
+        client.post("/api/v1/panes/${encPaneId(paneId)}/fork") {
             contentType(ContentType.Application.Json)
             setBody(ForkPaneRequest(account = account))
         }.body()
