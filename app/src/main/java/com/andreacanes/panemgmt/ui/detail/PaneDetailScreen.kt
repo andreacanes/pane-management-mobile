@@ -167,16 +167,28 @@ fun PaneDetailScreen(
     val config by authStore.configFlow.collectAsState(initial = null)
     val scope = rememberCoroutineScope()
 
-    var lines by remember { mutableStateOf<List<String>>(emptyList()) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // Per-pane state: key to paneId so navigating/creating a sibling pane
+    // gives a clean slate. Without the key, the captured chat `lines` from
+    // the previous pane persist in the composition until the first fresh
+    // fetch lands (~50-200 ms), which visibly bleeds the parent pane's
+    // history into a newly-created child. Same reasoning for paneInfo,
+    // error, approvals, currentApproval — all pane-scoped content.
+    // `inputText` deliberately does NOT key on paneId so a typed draft
+    // survives swipe-between-siblings.
+    var lines by remember(paneId) { mutableStateOf<List<String>>(emptyList()) }
+    var error by remember(paneId) { mutableStateOf<String?>(null) }
     var inputText by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var voiceListening by remember { mutableStateOf(false) }
     var voiceTranscript by remember { mutableStateOf("") }
-    var approvals by remember { mutableStateOf<List<ApprovalDto>>(emptyList()) }
-    var currentApproval by remember { mutableStateOf<ApprovalDto?>(null) }
-    var paneInfo by remember { mutableStateOf<PaneDto?>(null) }
+    var approvals by remember(paneId) { mutableStateOf<List<ApprovalDto>>(emptyList()) }
+    var currentApproval by remember(paneId) { mutableStateOf<ApprovalDto?>(null) }
+    var paneInfo by remember(paneId) { mutableStateOf<PaneDto?>(null) }
     var showKillDialog by remember { mutableStateOf(false) }
+    // Split/fork chooser — opens when the user taps + in the toolbar.
+    // Keyed to paneId so the dialog never stays open across navigation.
+    var showSplitOrForkDialog by remember(paneId) { mutableStateOf(false) }
+    var forking by remember(paneId) { mutableStateOf(false) }
     var killing by remember { mutableStateOf(false) }
     var showEffortMenu by remember { mutableStateOf(false) }
     var showModeMenu by remember { mutableStateOf(false) }
@@ -260,7 +272,15 @@ fun PaneDetailScreen(
             val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
             suspend fun refetchCapture() {
                 runCatching { client.capture(paneId, lines = CAPTURE_LINES) }
-                    .onSuccess { lines = it.lines }
+                    .onSuccess {
+                        // TEMP: plan section C instrumentation — remove after
+                        // the ~100-line investigation lands.
+                        android.util.Log.i(
+                            "pane-mgmt",
+                            "capture($paneId) -> ${it.lines.size} lines"
+                        )
+                        lines = it.lines
+                    }
                     .onFailure { error = it.message }
             }
             // Long-running consumer that drains the conflated channel and
@@ -347,7 +367,14 @@ fun PaneDetailScreen(
     // with a dim separator. The capture reflects what Claude is drawing
     // tmux scrollback is the sole content source — no JSONL reconstruction.
     val cleaned = remember(lines, onSurface) {
-        cleanOutputLines(lines, onSurface, lineCache)
+        cleanOutputLines(lines, onSurface, lineCache).also { result ->
+            // TEMP: plan section C instrumentation — remove after the
+            // ~100-line investigation lands.
+            android.util.Log.i(
+                "pane-mgmt",
+                "cleaned($paneId) -> ${result.lines.size} from ${lines.size} raw"
+            )
+        }
     }
     val displayLines = cleaned.lines
     val contextPct = cleaned.contextPct
@@ -360,7 +387,19 @@ fun PaneDetailScreen(
             if (detectedEffort == pendingEffort) pendingEffort = null
         }
     }
-    val currentEffort = pendingEffort ?: lastKnownEffort
+    // Server-side claude_effort is the authoritative sticky cache (the
+    // companion poller sees the banner before it scrolls out of its
+    // 45-line window and caches it for the lifetime of the Claude
+    // session). Fall back to client-side detection for older desktop
+    // builds that don't ship the field, or while the first server
+    // snapshot is still in flight.
+    val serverEffort = paneInfo?.claudeEffort
+    LaunchedEffect(serverEffort) {
+        if (serverEffort != null && serverEffort == pendingEffort) {
+            pendingEffort = null
+        }
+    }
+    val currentEffort = pendingEffort ?: serverEffort ?: lastKnownEffort
 
     // Auto-scroll to bottom whenever the *visible* line count changes,
     // but only when the user hasn't scrolled up to read scrollback —
@@ -484,6 +523,33 @@ fun PaneDetailScreen(
                 .onFailure {
                     error = "Split failed: ${it.message ?: it::class.simpleName}"
                     splitting = false
+                }
+            c.close()
+        }
+    }
+
+    /**
+     * Fork: drive Claude's `/branch` slash command on this pane (it mints
+     * a new session UUID internally, no process restart), then split a
+     * sibling pane that resumes the *original* session. Companion does
+     * the orchestration server-side. See
+     * `workspace-resume/src-tauri/src/companion/http.rs::fork_pane`.
+     */
+    fun forkPane() {
+        val info = paneInfo ?: return
+        val account = info.claudeAccount ?: "andrea"
+        forking = true
+        scope.launch {
+            val cfg = config ?: run { forking = false; return@launch }
+            val c = CompanionClient(cfg.baseUrl, cfg.bearerToken)
+            runCatching { c.forkPane(paneId, account) }
+                .onSuccess { resp ->
+                    forking = false
+                    onNavigateToPane(resp.paneId)
+                }
+                .onFailure {
+                    error = "Fork failed: ${it.message ?: it::class.simpleName}"
+                    forking = false
                 }
             c.close()
         }
@@ -620,8 +686,8 @@ fun PaneDetailScreen(
                         }
                     }
                     IconButton(
-                        onClick = { splitPane() },
-                        enabled = paneInfo != null && !splitting,
+                        onClick = { showSplitOrForkDialog = true },
+                        enabled = paneInfo != null && !splitting && !forking,
                         modifier = Modifier.size(36.dp),
                     ) {
                         Icon(
@@ -703,6 +769,28 @@ fun PaneDetailScreen(
                 }
             }
 
+            // Warning strip — surfaces companion-detected abnormalities on
+            // this pane, most commonly a session_id collision with a sibling
+            // pane. The companion guard in tmux_poller.rs refuses to bind a
+            // session_id already owned elsewhere and stamps the warning on
+            // the losing pane's DTO. Clears automatically when detection
+            // succeeds cleanly on a later tick.
+            paneInfo?.warning?.let { msg ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0x33FFA726))
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "⚠  $msg",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFFFB74D),
+                    )
+                }
+            }
+
             // Output view + floating quick-key column on the right edge.
             // Keys used to live in a full-width row below the output; moving
             // them inside the output Box as an overlay reclaims vertical
@@ -711,13 +799,13 @@ fun PaneDetailScreen(
                 SelectionContainer {
                     LazyColumn(
                         state = listState,
+                        // Text extends edge-to-edge; the FloatingQuickKeys
+                        // column draws on top of the right-edge strip. The
+                        // buttons are intentionally translucent so the
+                        // terminal output behind them stays readable.
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
                             start = 12.dp,
                             top = 12.dp,
-                            // Use the full pane width — the floating key
-                            // column is a semi-transparent overlay, not a
-                            // blocker. A tiny right margin keeps glyphs off
-                            // the very edge.
                             end = 12.dp,
                             bottom = 12.dp,
                         ),
@@ -1028,6 +1116,50 @@ fun PaneDetailScreen(
             },
         )
     }
+
+    // Split-or-fork chooser dialog — shown when the user taps + in the
+    // top toolbar. Two primary actions stacked in `confirmButton`; Fork
+    // disabled when no session_id has been detected yet (companion poller
+    // hasn't bound it, or pane isn't running Claude).
+    if (showSplitOrForkDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!splitting && !forking) showSplitOrForkDialog = false },
+            title = { Text("Open new pane") },
+            text = {
+                Text(
+                    "Split this window — choose what the new pane should contain.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Button(
+                        onClick = {
+                            showSplitOrForkDialog = false
+                            splitPane()
+                        },
+                        enabled = !splitting && !forking,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(if (splitting) "Opening…" else "New session") }
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            showSplitOrForkDialog = false
+                            forkPane()
+                        },
+                        enabled = paneInfo?.claudeSessionId != null && !splitting && !forking,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(if (forking) "Forking…" else "Fork conversation") }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showSplitOrForkDialog = false },
+                    enabled = !splitting && !forking,
+                ) { Text("Cancel") }
+            },
+        )
+    }
 }
 
 /**
@@ -1037,6 +1169,7 @@ fun PaneDetailScreen(
  *   "bypass permissions on (shift+tab to cycle)"
  *   "auto-accept edits on (shift+tab to cycle)"
  *   "plan mode on (shift+tab to cycle)"
+ *   "auto mode on (shift+tab to cycle)"
  * If none of those appear, the pane is in Normal mode.
  */
 internal enum class ClaudeMode(val label: String) {
@@ -1044,31 +1177,45 @@ internal enum class ClaudeMode(val label: String) {
     AutoAccept("Auto-Accept"),
     Plan("Plan"),
     Bypass("Bypass"),
+    Auto("Auto"),
 }
 
 internal fun detectClaudeMode(lines: List<String>): ClaudeMode {
     // Scan only the bottom of the buffer — mode indicators are always
     // near the prompt, never in scrollback content.
     val tail = lines.asReversed().take(20).joinToString("\n").lowercase()
+    // Test "auto-accept edits on" before "auto mode on" so the more-specific
+    // banner wins even if Claude ever reformats either line.
     return when {
         "bypass permissions on" in tail -> ClaudeMode.Bypass
         "auto-accept edits on" in tail -> ClaudeMode.AutoAccept
         "plan mode on" in tail -> ClaudeMode.Plan
+        "auto mode on" in tail -> ClaudeMode.Auto
         else -> ClaudeMode.Normal
     }
 }
 
 /**
- * Detect the pane's current `/effort` level by scanning the tail for either
- * Claude's status-line indicator ("effort: high") or the echoed `/effort X`
- * command the user last ran. Returns null when neither appears — the chip
- * then renders "—" instead of guessing.
+ * Client-side fallback effort detector, used when the companion's
+ * `claude_effort` DTO field is null (older desktop build, or the first
+ * server snapshot hasn't arrived yet). Scans the last 60 lines of the
+ * captured output for two signals:
+ * - Claude Code 2.1+ session banner: `"with max effort · Claude Max"` —
+ *   the level precedes the word "effort".
+ * - Echoed `/effort <level>` — what the chip setter sends, and what
+ *   the user types manually.
+ *
+ * Returns null when neither signal is found; the chip renders "—"
+ * instead of guessing. We deliberately do NOT match the looser
+ * `"effort <level>"` pattern because Claude's `/` menu help text
+ * contains phrases like `"effort: low | medium | high | max"` that
+ * would false-positive on the first listed level.
  */
 internal fun detectEffort(lines: List<String>): String? {
     val tail = lines.asReversed().take(60).joinToString("\n").lowercase()
-    val statusLine = Regex("""effort[:\s]+(low|medium|high|max)\b""").findAll(tail)
+    val banner = Regex("""\b(low|medium|high|max)\s+effort\b""").findAll(tail)
         .lastOrNull()?.groupValues?.get(1)
-    if (statusLine != null) return statusLine
+    if (banner != null) return banner
     val slash = Regex("""/effort\s+(low|medium|high|max)\b""").findAll(tail)
         .lastOrNull()?.groupValues?.get(1)
     return slash
@@ -1171,9 +1318,12 @@ private fun QuickKeyButton(
     FilledIconButton(
         onClick = onClick,
         modifier = modifier.size(44.dp),
+        // Translucent fill so the terminal output flowing underneath the
+        // button column stays readable — the chat is now full-width, so
+        // the right-edge strip is covered by these buttons at all times.
         colors = IconButtonDefaults.filledIconButtonColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
-                .copy(alpha = 0.88f),
+                .copy(alpha = 0.55f),
             contentColor = MaterialTheme.colorScheme.onSurface,
         ),
     ) {
@@ -1224,6 +1374,7 @@ private fun ModeChip(
         ClaudeMode.AutoAccept -> StatusColors.Running
         ClaudeMode.Plan       -> StatusColors.Done
         ClaudeMode.Bypass     -> Color(0xFFFF6B6B)
+        ClaudeMode.Auto       -> Color(0xFFA78BFA) // violet — distinct from auto-accept green
     }
     Box(modifier = Modifier.padding(end = 2.dp)) {
         Row(
@@ -1256,11 +1407,13 @@ private fun ModeChip(
 }
 
 /**
- * Claude `/effort` level picker — pill-shaped chip that opens a dropdown
- * of low / medium / high / max. There is no reliable signal to detect
- * the *current* effort level from the terminal, so the chip doesn't
- * display one; it's a setter, not a status. Tapping a level sends
- * `/effort <level>` into the pane.
+ * Claude `/effort` level picker — pill-shaped chip that both displays
+ * the current level and opens a dropdown of low / medium / high / max.
+ * Current level comes from (in priority order): the user's just-tapped
+ * pending pick, the companion's server-side `claude_effort` field, or
+ * the client's own tail scan (`detectEffort`). Renders "—" only when
+ * all three are unknown. Tapping a level sends `/effort <level>` into
+ * the pane.
  */
 @Composable
 private fun EffortChip(

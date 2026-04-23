@@ -66,7 +66,13 @@ fun PaneMgmtApp() {
             PaneGridScreen(
                 authStore = authStore,
                 onOpenPane = { paneId ->
-                    navController.navigate(Routes.detail(paneId))
+                    navController.navigate(Routes.detail(paneId)) {
+                        // Keep the back stack shallow: pressing back from a
+                        // detail screen always lands on the grid, never on a
+                        // previously-viewed pane. Mirrors the deep-link path.
+                        popUpTo(Routes.GRID) { inclusive = false }
+                        launchSingleTop = true
+                    }
                 },
                 onLoggedOut = {
                     navController.navigate(Routes.SETUP) {
@@ -86,7 +92,10 @@ fun PaneMgmtApp() {
                 paneId = paneId,
                 onBack = { navController.popBackStack() },
                 onNavigateToPane = { targetPaneId ->
-                    navController.navigate(Routes.detail(targetPaneId))
+                    navController.navigate(Routes.detail(targetPaneId)) {
+                        popUpTo(Routes.GRID) { inclusive = false }
+                        launchSingleTop = true
+                    }
                 },
             )
         }

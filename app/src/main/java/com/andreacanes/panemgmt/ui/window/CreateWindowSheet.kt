@@ -59,10 +59,12 @@ import kotlinx.coroutines.launch
 
 private val AndreaColor = Color(0xFF818CF8) // indigo
 private val BravuraColor = Color(0xFFF59E0B) // amber
+private val SullyColor = Color(0xFF14B8A6)   // teal
 
 private enum class LauncherAccount(val key: String, val label: String, val color: Color) {
     Andrea("andrea", "Andrea", AndreaColor),
     Bravura("bravura", "Bravura", BravuraColor),
+    Sully("sully", "Sully", SullyColor),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

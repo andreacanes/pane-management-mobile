@@ -93,25 +93,29 @@ private enum class GridTab(val label: String) {
 private const val STASHED_THRESHOLD_MS: Long = 60L * 60L * 1000L
 
 private enum class ClaudeAccount(val label: String, val color: Color) {
-    Andrea("Andrea", Color(0xFF818CF8)),
-    Bravura("Bravura", Color(0xFFF59E0B)),
+    Andrea("Andrea", Color(0xFF818CF8)),     // indigo
+    Bravura("Bravura", Color(0xFFF59E0B)),   // amber
+    Sully("Sully", Color(0xFF14B8A6)),       // teal
 }
 
 /**
  * Pick the account for a pane. Prefer the server-detected
- * `claudeAccount` field (read from `/proc/<pid>/environ`), fall back
+ * `claudeAccount` field (read from `/proc/<pid>/environ` on local panes,
+ * synthesized from pane assignment on remote panes), fall back
  * to the command-string regex for panes where detection failed or the
  * server is old.
  */
 private fun accountFor(pane: PaneDto): ClaudeAccount? {
     pane.claudeAccount?.let {
         return when (it) {
+            "sully" -> ClaudeAccount.Sully
             "bravura" -> ClaudeAccount.Bravura
             "andrea" -> ClaudeAccount.Andrea
             else -> null
         }
     }
     val c = pane.currentCommand.lowercase()
+    if (c == "claude-c") return ClaudeAccount.Sully
     if (c == "claude-b") return ClaudeAccount.Bravura
     if (c.contains("claude")) return ClaudeAccount.Andrea
     return null
@@ -352,23 +356,18 @@ fun PaneGridScreen(
     }
     val allCount = panes.size
 
-    // Request-flavored waiting (approvals, questions) should surface above
-    // Continue-flavored waiting (Claude just stopped). 0 sorts first.
-    fun waitingPriority(p: PaneDto): Int =
-        if (approvalPaneIds.contains(p.id)) 0
-        else when (p.waitingReason) {
-            WaitingReason.Request  -> 0
-            null                   -> 1
-            WaitingReason.Continue -> 2
-        }
+    // Every tab is ordered by the visible terminal coordinate
+    // (session:window.pane) so that the cards stay in a stable, predictable
+    // position regardless of which filter is active or what the companion's
+    // snapshot order happens to be.
+    val terminalOrder = compareBy<PaneDto>({ it.sessionName }, { it.windowIndex }, { it.paneIndex })
 
     fun panesForTab(tab: GridTab): List<PaneDto> = when (tab) {
         GridTab.Active  -> panes.filter { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
-        GridTab.Waiting -> panes.filter { isWaiting(it) }
-            .sortedBy { waitingPriority(it) }
-        GridTab.Stashed -> panes.filter { isStashed(it) }
-            .sortedBy { lastActivity(it) } // oldest first — most "stashed" at top
-        GridTab.All     -> panes
+                                .sortedWith(terminalOrder)
+        GridTab.Waiting -> panes.filter { isWaiting(it) }.sortedWith(terminalOrder)
+        GridTab.Stashed -> panes.filter { isStashed(it) }.sortedWith(terminalOrder)
+        GridTab.All     -> panes.sortedWith(terminalOrder)
     }
 
     Scaffold(
@@ -569,6 +568,7 @@ private fun ConnectionDot(connected: Boolean, reconnecting: Boolean) {
 @Composable
 private fun RateLimitChip(rl: AccountRateLimitDto) {
     val acctColor = when (rl.account) {
+        "sully" -> ClaudeAccount.Sully.color
         "bravura" -> ClaudeAccount.Bravura.color
         else -> ClaudeAccount.Andrea.color
     }

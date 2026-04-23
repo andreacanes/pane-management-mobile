@@ -10,6 +10,7 @@ import com.andreacanes.panemgmt.data.models.CreateWindowRequest
 import com.andreacanes.panemgmt.data.models.CreateWindowResponse
 import com.andreacanes.panemgmt.data.models.Decision
 import com.andreacanes.panemgmt.data.models.EventDto
+import com.andreacanes.panemgmt.data.models.ForkPaneRequest
 import com.andreacanes.panemgmt.data.models.HealthDto
 import com.andreacanes.panemgmt.data.models.PaneDto
 import com.andreacanes.panemgmt.data.models.ProjectDto
@@ -261,6 +262,23 @@ class CompanionClient(
         client.post("/api/v1/panes") {
             contentType(ContentType.Application.Json)
             setBody(CreatePaneRequest(targetPaneId = targetPaneId, account = account, direction = direction))
+        }.body()
+
+    /**
+     * Fork the Claude conversation running in [paneId]. The companion
+     * sends `/branch` to the source pane (Claude mints a new session UUID
+     * internally and continues in place) and splits a sibling pane that
+     * resumes the *original* session. Caller supplies [account] so the
+     * new pane knows whether to use `ncld` or `ncld2`. Returns the new
+     * pane's id.
+     */
+    suspend fun forkPane(
+        paneId: String,
+        account: String,
+    ): CreatePaneResponse =
+        client.post("/api/v1/panes/$paneId/fork") {
+            contentType(ContentType.Application.Json)
+            setBody(ForkPaneRequest(account = account))
         }.body()
 
     // ---- WebSocket --------------------------------------------------------

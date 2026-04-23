@@ -59,13 +59,26 @@ data class PaneDto(
     @SerialName("project_encoded_name") val projectEncodedName: String? = null,
     @SerialName("project_display_name") val projectDisplayName: String? = null,
     @SerialName("claude_session_id") val claudeSessionId: String? = null,
-    /** "andrea" | "bravura" | null — detected from child process env. */
+    /** "andrea" | "bravura" | "sully" | null — detected from child process
+     *  env (`CLAUDE_CONFIG_DIR`) on local panes, synthesized from pane
+     *  assignment on remote (Mac) panes. */
     @SerialName("claude_account") val claudeAccount: String? = null,
+    /** Current `/effort` level ("low" | "medium" | "high" | "max") detected
+     *  by the companion poller from the pane's terminal output. Null when
+     *  detection hasn't fired yet (fresh pane, or banner scrolled off before
+     *  desktop startup) or for non-Claude panes. The EffortChip prefers this
+     *  over its own client-side tail scan. */
+    @SerialName("claude_effort") val claudeEffort: String? = null,
     @SerialName("updated_at") val updatedAt: Long,
     /** Epoch ms of the last conversation message (JSONL mtime). Null
      *  when the pane has no bound Claude session or the JSONL doesn't
      *  exist yet. Use this for "real activity" filters. */
     @SerialName("last_activity_at") val lastActivityAt: Long? = null,
+    /** Operator-visible warning set by the companion when it detects an
+     *  abnormal state — e.g., this pane's session_id collides with
+     *  another pane. UI renders as a yellow chip with this text as the
+     *  tooltip / subtitle. Null for healthy panes. */
+    val warning: String? = null,
 )
 
 @Serializable
@@ -176,6 +189,18 @@ data class CreatePaneRequest(
 @Serializable
 data class CreatePaneResponse(
     @SerialName("pane_id") val paneId: String,
+)
+
+/**
+ * Request body for `POST /api/v1/panes/{id}/fork`. Target pane id is
+ * in the URL path; the source session_id is read server-side from the
+ * companion's poller state, so the caller only needs to supply which
+ * account's launcher (`ncld` vs `ncld2`) to use in the new pane.
+ * Response reuses [CreatePaneResponse].
+ */
+@Serializable
+data class ForkPaneRequest(
+    val account: String,
 )
 
 /**
