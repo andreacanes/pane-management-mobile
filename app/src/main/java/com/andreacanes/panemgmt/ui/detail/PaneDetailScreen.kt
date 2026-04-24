@@ -34,8 +34,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Image
@@ -272,15 +272,7 @@ fun PaneDetailScreen(
             val client = CompanionClient(cfg.baseUrl, cfg.bearerToken)
             suspend fun refetchCapture() {
                 runCatching { client.capture(paneId, lines = CAPTURE_LINES) }
-                    .onSuccess {
-                        // TEMP: plan section C instrumentation — remove after
-                        // the ~100-line investigation lands.
-                        android.util.Log.i(
-                            "pane-mgmt",
-                            "capture($paneId) -> ${it.lines.size} lines"
-                        )
-                        lines = it.lines
-                    }
+                    .onSuccess { lines = it.lines }
                     .onFailure { error = it.message }
             }
             // Long-running consumer that drains the conflated channel and
@@ -367,14 +359,7 @@ fun PaneDetailScreen(
     // with a dim separator. The capture reflects what Claude is drawing
     // tmux scrollback is the sole content source — no JSONL reconstruction.
     val cleaned = remember(lines, onSurface) {
-        cleanOutputLines(lines, onSurface, lineCache).also { result ->
-            // TEMP: plan section C instrumentation — remove after the
-            // ~100-line investigation lands.
-            android.util.Log.i(
-                "pane-mgmt",
-                "cleaned($paneId) -> ${result.lines.size} from ${lines.size} raw"
-            )
-        }
+        cleanOutputLines(lines, onSurface, lineCache)
     }
     val displayLines = cleaned.lines
     val contextPct = cleaned.contextPct
@@ -630,7 +615,7 @@ fun PaneDetailScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
@@ -955,7 +940,7 @@ fun PaneDetailScreen(
                         cursorColor = MaterialTheme.colorScheme.primary,
                     ),
                     keyboardOptions = KeyboardOptions(
-                        autoCorrect = false,
+                        autoCorrectEnabled = false,
                         capitalization = KeyboardCapitalization.None,
                         keyboardType = KeyboardType.Text,
                     ),

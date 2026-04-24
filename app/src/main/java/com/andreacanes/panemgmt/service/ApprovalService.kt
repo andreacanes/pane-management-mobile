@@ -220,14 +220,56 @@ class ApprovalService : Service() {
                 // Stream completed cleanly — reconnect after a beat.
             } catch (t: CancellationException) {
                 throw t
-            } catch (_: Throwable) {
-                // Swallow — we'll back off and retry.
+            } catch (t: Throwable) {
+                // Classify Ktor's ClientRequestException (thrown on 4xx
+                // because the Ktor client has expectSuccess = true).
+                // 401/403 means the bearer was rotated out from under us
+                // — reconnecting forever just burns the battery. Surface
+                // a sticky "re-login needed" notification and stop the
+                // service so the user sees something actionable. Any
+                // other error (timeout, network) stays on the retry
+                // path.
+                val status = (t as? io.ktor.client.plugins.ClientRequestException)
+                    ?.response?.status?.value
+                if (status == 401 || status == 403) {
+                    postReloginRequiredNotification()
+                    runCatching { client.close() }
+                    stopSelf()
+                    return
+                }
+                // Otherwise swallow and back off.
             } finally {
                 runCatching { client.close() }
             }
             delay(backoff)
             backoff = (backoff * 2).coerceAtMost(15_000L)
         }
+    }
+
+    /**
+     * Posts a sticky notification telling the user the bearer token no
+     * longer authenticates and they need to re-run the setup flow (QR
+     * scan or manual re-entry of URL + bearer).
+     */
+    private fun postReloginRequiredNotification() {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pi = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notif = NotificationCompat.Builder(this, NotificationChannels.WATCHER)
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setContentTitle("Companion re-login needed")
+            .setContentText("Bearer token no longer accepted — tap to re-auth")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .build()
+        NotificationManagerCompat.from(this)
+            .notify(RELOGIN_NOTIF_ID, notif)
     }
 
     // -----------------------------------------------------------------------
@@ -335,6 +377,9 @@ class ApprovalService : Service() {
     companion object {
         private const val NOTIF_WATCHER_ID = 1001
         private const val REQ_OPEN_APP = 2001
+        /** Fixed id for the sticky re-auth notification so it coalesces
+         *  instead of spawning a fresh notification on every 401. */
+        private const val RELOGIN_NOTIF_ID = 424242
         /** Monotonic counter for notification IDs. Avoids hash collisions
          *  from UUID.hashCode() and resets safely on service restart. */
         private val nextNotifId = AtomicInteger(10_000)

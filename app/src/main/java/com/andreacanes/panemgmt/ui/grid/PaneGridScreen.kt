@@ -887,7 +887,16 @@ private fun PaneCard(
             .substringAfterLast('/')
             .takeIf { it.isNotBlank() }
         ?: pane.sessionName.ifBlank { pane.id }
-    val coords = "${pane.sessionName}:${pane.windowIndex}.${pane.paneIndex}"
+    // Prefix remote panes with the host alias so two panes with the
+    // same coords on different hosts (e.g. local `main:1.1` vs Mac
+    // `main:1.1`) are visually distinguishable. `host` is nullable on
+    // older wire payloads; null/blank/"local" all render as the bare
+    // coords without a prefix.
+    val hostLabel = pane.host?.takeIf { it.isNotBlank() && it != "local" }
+    val coords = if (hostLabel != null)
+        "$hostLabel/${pane.sessionName}:${pane.windowIndex}.${pane.paneIndex}"
+    else
+        "${pane.sessionName}:${pane.windowIndex}.${pane.paneIndex}"
     val claudeSessionShort = pane.claudeSessionId?.take(8)
     val account = accountFor(pane)
     val elapsed = formatElapsed(pane.updatedAt)
