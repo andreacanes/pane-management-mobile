@@ -83,6 +83,22 @@ data class PaneDto(
      *  another pane. UI renders as a yellow chip with this text as the
      *  tooltip / subtitle. Null for healthy panes. */
     val warning: String? = null,
+    /** Set when this pane is a local SSH mirror — its `start_command`
+     *  is `ssh -t <alias> tmux attach-session -t <session>`, used by
+     *  the desktop as a viewport into a remote tmux server. The phone
+     *  has no local terminal to mirror into, so the APK filters these
+     *  panes out of its main list. The backend stamps this via
+     *  `services::ssh_mirror::parse_mirror_target`; the same field
+     *  drives the desktop's 🔗-label rendering. Null for ordinary panes. */
+    @SerialName("mirror_target") val mirrorTarget: MirrorTargetDto? = null,
+)
+
+/** Companion of [PaneDto.mirrorTarget]. The `<alias>/<session>` pair
+ *  the local SSH-mirror pane points at on a remote tmux server. */
+@Serializable
+data class MirrorTargetDto(
+    val alias: String,
+    val session: String,
 )
 
 @Serializable

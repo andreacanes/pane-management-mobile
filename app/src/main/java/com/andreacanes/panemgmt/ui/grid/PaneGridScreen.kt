@@ -345,16 +345,23 @@ fun PaneGridScreen(
             !isWaiting(p) &&
             (nowMs - lastActivity(p)) > STASHED_THRESHOLD_MS
 
-    val activeCount = remember(panes, approvalPaneIds) {
-        panes.count { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
+    // Filter SSH-mirror panes out of every list/count on the phone.
+    // They're a desktop-side concept (a local pane that mirrors a Mac
+    // session into WezTerm); the phone has no local terminal to mirror
+    // into, so the mirror's row would be confusing noise. The actual
+    // remote pane it points at still surfaces normally with host="mac".
+    val visiblePanes = remember(panes) { panes.filter { it.mirrorTarget == null } }
+
+    val activeCount = remember(visiblePanes, approvalPaneIds) {
+        visiblePanes.count { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
     }
-    val waitingCount = remember(panes, approvalPaneIds) {
-        panes.count { isWaiting(it) }
+    val waitingCount = remember(visiblePanes, approvalPaneIds) {
+        visiblePanes.count { isWaiting(it) }
     }
-    val stashedCount = remember(panes, approvalPaneIds, nowMs) {
-        panes.count { isStashed(it) }
+    val stashedCount = remember(visiblePanes, approvalPaneIds, nowMs) {
+        visiblePanes.count { isStashed(it) }
     }
-    val allCount = panes.size
+    val allCount = visiblePanes.size
 
     // Every tab is ordered by the visible terminal coordinate
     // (session:window.pane) so that the cards stay in a stable, predictable
@@ -363,11 +370,11 @@ fun PaneGridScreen(
     val terminalOrder = compareBy<PaneDto>({ it.sessionName }, { it.windowIndex }, { it.paneIndex })
 
     fun panesForTab(tab: GridTab): List<PaneDto> = when (tab) {
-        GridTab.Active  -> panes.filter { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
+        GridTab.Active  -> visiblePanes.filter { it.state == PaneState.Running && !approvalPaneIds.contains(it.id) }
                                 .sortedWith(terminalOrder)
-        GridTab.Waiting -> panes.filter { isWaiting(it) }.sortedWith(terminalOrder)
-        GridTab.Stashed -> panes.filter { isStashed(it) }.sortedWith(terminalOrder)
-        GridTab.All     -> panes.sortedWith(terminalOrder)
+        GridTab.Waiting -> visiblePanes.filter { isWaiting(it) }.sortedWith(terminalOrder)
+        GridTab.Stashed -> visiblePanes.filter { isStashed(it) }.sortedWith(terminalOrder)
+        GridTab.All     -> visiblePanes.sortedWith(terminalOrder)
     }
 
     Scaffold(
