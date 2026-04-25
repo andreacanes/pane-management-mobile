@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -100,6 +101,7 @@ import com.andreacanes.panemgmt.ViewedPaneBus
 import com.andreacanes.panemgmt.data.AuthStore
 import com.andreacanes.panemgmt.data.CompanionClient
 import com.andreacanes.panemgmt.data.models.ApprovalDto
+import com.andreacanes.panemgmt.data.models.AttachRemoteSessionRequest
 import com.andreacanes.panemgmt.data.models.Decision
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.ImageItemDto
@@ -190,6 +192,7 @@ fun PaneDetailScreen(
     var showSplitOrForkDialog by remember(paneId) { mutableStateOf(false) }
     var forking by remember(paneId) { mutableStateOf(false) }
     var killing by remember { mutableStateOf(false) }
+    var attaching by remember(paneId) { mutableStateOf(false) }
     var showEffortMenu by remember { mutableStateOf(false) }
     var showModeMenu by remember { mutableStateOf(false) }
     var pendingEffort by remember(paneId) { mutableStateOf<String?>(null) }
@@ -685,6 +688,58 @@ fun PaneDetailScreen(
                                         .padding(bottom = 2.dp),
                                 )
                             }
+                        }
+                    }
+                    // Remote-pane only: ask the desktop to open (or
+                    // re-select) a local WSL tmux window that
+                    // SSH-attaches to this pane's session, so the user
+                    // sees the same terminal in WezTerm next time
+                    // they're on the desktop. Mirrors the desktop's
+                    // "Attach here" PaneSlot menu item. Idempotent:
+                    // backing endpoint re-uses an existing mirror.
+                    val remoteHost = paneInfo?.host
+                    if (!remoteHost.isNullOrEmpty() && remoteHost != "local") {
+                        IconButton(
+                            onClick = {
+                                val info = paneInfo ?: return@IconButton
+                                val cfg = config ?: return@IconButton
+                                attaching = true
+                                scope.launch {
+                                    val c = CompanionClient(cfg.baseUrl, cfg.bearerToken)
+                                    val result = runCatching {
+                                        c.attachRemoteSession(
+                                            AttachRemoteSessionRequest(
+                                                alias = remoteHost,
+                                                sessionName = info.sessionName,
+                                            )
+                                        )
+                                    }
+                                    c.close()
+                                    attaching = false
+                                    result.onSuccess { resp ->
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Mirror ready: ${resp.localWindowName}",
+                                            android.widget.Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }.onFailure { t ->
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Attach failed: ${t.message ?: "unknown"}",
+                                            android.widget.Toast.LENGTH_LONG,
+                                        ).show()
+                                    }
+                                }
+                            },
+                            enabled = paneInfo != null && !attaching,
+                            modifier = Modifier.size(36.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.OpenInNew,
+                                contentDescription = "Attach mirror window on desktop",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp),
+                            )
                         }
                     }
                     IconButton(

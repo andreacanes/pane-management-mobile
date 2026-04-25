@@ -182,6 +182,78 @@ data class CreateWindowResponse(
     @SerialName("pane_id") val paneId: String,
 )
 
+/**
+ * Request body for `POST /api/v1/launch-host-session` — the APK's
+ * entry point for "start Claude on a Mac (or any remote) without
+ * needing the desktop attached". `host` must be a non-local SSH alias
+ * ("mac" for now); the backend 400s on "local" because the existing
+ * `/windows` endpoint already handles that case. `projectPath` is the
+ * WSL-side path returned by `/projects` — the backend derives the
+ * basename and translates to the remote-host convention.
+ */
+@Serializable
+data class LaunchHostSessionRequest(
+    val host: String,
+    val account: String,
+    @SerialName("project_path") val projectPath: String,
+    @SerialName("project_display_name") val projectDisplayName: String,
+)
+
+@Serializable
+data class LaunchHostSessionResponse(
+    @SerialName("pane_id") val paneId: String,
+    @SerialName("window_index") val windowIndex: Int,
+    @SerialName("session_name") val sessionName: String,
+)
+
+/**
+ * Request body for `POST /api/v1/sync-project-to-mac`. Kicks the
+ * Mutagen helper so a not-yet-mirrored project becomes reachable for
+ * a Mac launch. Idempotent — re-running for an already-synced project
+ * is a no-op. Used by the "Sync now" retry button that the launch
+ * sheet shows when `launchHostSession` returns 400 "not mirrored".
+ */
+@Serializable
+data class SyncProjectRequest(
+    @SerialName("encoded_project") val encodedProject: String,
+)
+
+@Serializable
+data class SyncProjectResponse(
+    val output: String,
+)
+
+/**
+ * Request body for `POST /api/v1/attach-remote-session`. Asks the
+ * desktop to create (or re-select) a local WSL tmux window that
+ * SSH-attaches to the named remote session. Used by the phone's
+ * "Attach here" affordance so a Mac mirror is ready in WezTerm by
+ * the time the user gets back to their desktop. Idempotent — a
+ * duplicate request just re-selects the existing window.
+ */
+@Serializable
+data class AttachRemoteSessionRequest(
+    val alias: String,
+    @SerialName("session_name") val sessionName: String,
+)
+
+@Serializable
+data class AttachRemoteSessionResponse(
+    @SerialName("local_window_name") val localWindowName: String,
+)
+
+/**
+ * Response for `GET /api/v1/remote-hosts`. Sorted union of hosts
+ * referenced by any pane_assignment + the user's configured
+ * `remote_hosts` store, with a `["mac"]` first-run fallback. Used by
+ * the launch sheet's host segmented control so adding a third host
+ * doesn't require an APK rebuild.
+ */
+@Serializable
+data class RemoteHostsResponse(
+    val hosts: List<String>,
+)
+
 @Serializable
 data class CreatePaneRequest(
     @SerialName("target_pane_id") val targetPaneId: String,

@@ -9,6 +9,13 @@ import com.andreacanes.panemgmt.data.models.CreatePaneResponse
 import com.andreacanes.panemgmt.data.models.CreateWindowRequest
 import com.andreacanes.panemgmt.data.models.CreateWindowResponse
 import com.andreacanes.panemgmt.data.models.Decision
+import com.andreacanes.panemgmt.data.models.AttachRemoteSessionRequest
+import com.andreacanes.panemgmt.data.models.AttachRemoteSessionResponse
+import com.andreacanes.panemgmt.data.models.LaunchHostSessionRequest
+import com.andreacanes.panemgmt.data.models.LaunchHostSessionResponse
+import com.andreacanes.panemgmt.data.models.RemoteHostsResponse
+import com.andreacanes.panemgmt.data.models.SyncProjectRequest
+import com.andreacanes.panemgmt.data.models.SyncProjectResponse
 import com.andreacanes.panemgmt.data.models.EventDto
 import com.andreacanes.panemgmt.data.models.ForkPaneRequest
 import com.andreacanes.panemgmt.data.models.HealthDto
@@ -243,6 +250,55 @@ class CompanionClient(
             contentType(ContentType.Application.Json)
             setBody(req)
         }.body()
+
+    /**
+     * Start (or attach to) a per-project tmux session on a remote host
+     * and launch `mncld`/`mncld2`/`mncld3` inside it. Mirrors the
+     * `cc <project> <account>` flow on Mac but works from the phone
+     * without needing the desktop attached. Errors (e.g. "project not
+     * mirrored") surface as 400 with a message body the sheet shows
+     * inline.
+     */
+    suspend fun launchHostSession(req: LaunchHostSessionRequest): LaunchHostSessionResponse =
+        client.post("/api/v1/launch-host-session") {
+            contentType(ContentType.Application.Json)
+            setBody(req)
+        }.body()
+
+    /**
+     * Trigger the Mutagen `sync-add-project` helper on the WSL side so
+     * a project that hasn't been mirrored to Mac yet becomes
+     * reachable. Idempotent. The response's `output` is the helper's
+     * combined stdout — useful for a toast showing which sync phase
+     * completed ("creating session", "already exists", etc.).
+     */
+    suspend fun syncProjectToMac(req: SyncProjectRequest): SyncProjectResponse =
+        client.post("/api/v1/sync-project-to-mac") {
+            contentType(ContentType.Application.Json)
+            setBody(req)
+        }.body()
+
+    /**
+     * Ask the desktop to open (or re-select) a local WSL tmux window
+     * that SSH-attaches to a remote tmux session. Companion delegates
+     * to the same `attach_remote_session` Tauri command the desktop's
+     * "Attach here" button uses, so phone + desktop converge on the
+     * same `<alias>/<session>` mirror window. Idempotent.
+     */
+    suspend fun attachRemoteSession(req: AttachRemoteSessionRequest): AttachRemoteSessionResponse =
+        client.post("/api/v1/attach-remote-session") {
+            contentType(ContentType.Application.Json)
+            setBody(req)
+        }.body()
+
+    /**
+     * Distinct remote SSH aliases the desktop currently knows about
+     * (union of pane_assignments + configured `remote_hosts` store +
+     * first-run `["mac"]` fallback). Used by the launch sheet to drive
+     * the host segmented control without hardcoding the host list.
+     */
+    suspend fun listRemoteHosts(): RemoteHostsResponse =
+        client.get("/api/v1/remote-hosts").body()
 
     /**
      * Kill a tmux window by session + index. Terminates every pane in

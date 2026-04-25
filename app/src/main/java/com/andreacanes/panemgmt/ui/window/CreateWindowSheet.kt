@@ -53,7 +53,11 @@ import com.andreacanes.panemgmt.data.AuthStore
 import com.andreacanes.panemgmt.data.CompanionClient
 import com.andreacanes.panemgmt.data.models.CreateWindowRequest
 import com.andreacanes.panemgmt.data.models.CreateWindowResponse
+import com.andreacanes.panemgmt.data.models.LaunchHostSessionRequest
 import com.andreacanes.panemgmt.data.models.ProjectDto
+import com.andreacanes.panemgmt.data.models.SyncProjectRequest
+import io.ktor.client.plugins.ClientRequestException
+import io.ktor.client.statement.bodyAsText
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -65,6 +69,44 @@ private enum class LauncherAccount(val key: String, val label: String, val color
     Andrea("andrea", "Andrea", AndreaColor),
     Bravura("bravura", "Bravura", BravuraColor),
     Sully("sully", "Sully", SullyColor),
+}
+
+/**
+ * One option in the host segmented control. `key = "local"` routes to
+ * the existing `/windows` codepath (tmux window on the local main
+ * session, starts `ncld`); any other key routes to
+ * `/launch-host-session` (per-project tmux session on the named SSH
+ * alias, starts `mncld`). Labels match the desktop's CreatePaneModal.
+ *
+ * The full list comes from `GET /api/v1/remote-hosts` at sheet open;
+ * the bootstrap `[WSL, Mac]` keeps the segmented row populated even
+ * if the host fetch fails or the user is fully offline.
+ */
+private data class LauncherHost(val key: String, val label: String)
+
+private val WSL_HOST = LauncherHost("local", "WSL")
+private val MAC_HOST_DEFAULT = LauncherHost("mac", "Mac")
+
+/** Title-case an SSH alias for display ("mac" → "Mac"). Kept simple
+ *  because the alias is already user-chosen and short. */
+private fun aliasLabel(alias: String): String =
+    alias.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+
+/**
+ * Pull the readable error message out of a thrown exception. Ktor's
+ * `ClientRequestException` carries the server's response body (which
+ * contains the AppError JSON like `{"error": "bad request: ..."}`);
+ * plain exceptions fall back to `message`. Without this the user sees
+ * "Client request invalid: https://..." which is useless. Runs
+ * `bodyAsText()` inside a `runCatching` so a body read failure can't
+ * throw inside an error handler.
+ */
+private suspend fun extractErrorBody(t: Throwable): String {
+    if (t is ClientRequestException) {
+        val body = runCatching { t.response.bodyAsText() }.getOrNull().orEmpty()
+        if (body.isNotBlank()) return body
+    }
+    return t.message ?: t::class.simpleName ?: "unknown error"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -84,7 +126,19 @@ fun CreateWindowSheet(
     var query by remember { mutableStateOf("") }
     var selectedProject by remember { mutableStateOf<ProjectDto?>(null) }
     var selectedAccount by remember { mutableStateOf(LauncherAccount.Andrea) }
+    // Bootstrap with WSL + Mac so the row is interactive even before
+    // the remote-hosts fetch lands. Replaced once the fetch succeeds.
+    var hostOptions by remember {
+        mutableStateOf(listOf(WSL_HOST, MAC_HOST_DEFAULT))
+    }
+    var selectedHost by remember { mutableStateOf(WSL_HOST) }
     var launching by remember { mutableStateOf(false) }
+    // When a Mac launch fails with 400 "not mirrored", we show an
+    // inline "Sync now" button that kicks the Mutagen helper and
+    // retries the launch. Non-null = sync button visible, carries the
+    // encoded_project to pass to /api/v1/sync-project-to-mac.
+    var notMirroredFor by remember { mutableStateOf<String?>(null) }
+    var syncing by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         val config = authStore.configFlow.first()
@@ -96,6 +150,16 @@ fun CreateWindowSheet(
         val client = CompanionClient(config.baseUrl, config.bearerToken)
         try {
             projects = client.listProjects()
+            // Replace the bootstrap [WSL, Mac] with the actual host list
+            // from the desktop. WSL is always prepended because the
+            // server only returns *remote* aliases. Failure is silent —
+            // the bootstrap list keeps working.
+            runCatching { client.listRemoteHosts() }
+                .onSuccess { resp ->
+                    hostOptions = listOf(WSL_HOST) + resp.hosts
+                        .filter { it.isNotBlank() && it != "local" }
+                        .map { LauncherHost(it, aliasLabel(it)) }
+                }
         } catch (t: Throwable) {
             error = t.message ?: t::class.simpleName
         } finally {
@@ -131,6 +195,25 @@ fun CreateWindowSheet(
                 text = "Launch window",
                 style = MaterialTheme.typography.titleMedium,
             )
+
+            // Host selector — WSL keeps the pre-existing "add a window to
+            // the local main session" flow; Mac hits the new
+            // `/launch-host-session` endpoint which creates or attaches
+            // to a per-project Mac tmux session and starts mncld.
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                hostOptions.forEachIndexed { index, host ->
+                    SegmentedButton(
+                        selected = selectedHost.key == host.key,
+                        onClick = { selectedHost = host },
+                        shape = SegmentedButtonDefaults.itemShape(
+                            index = index,
+                            count = hostOptions.size,
+                        ),
+                    ) {
+                        Text(host.label)
+                    }
+                }
+            }
 
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 LauncherAccount.entries.forEachIndexed { index, acct ->
@@ -196,9 +279,83 @@ fun CreateWindowSheet(
                 }
             }
 
+            // Inline "Sync now" retry: only visible when the previous
+            // Mac launch failed with the "not mirrored" 400. One tap
+            // runs Mutagen, then retries the launch automatically.
+            if (notMirroredFor != null) {
+                Button(
+                    onClick = {
+                        val proj = selectedProject ?: return@Button
+                        val encoded = notMirroredFor ?: return@Button
+                        scope.launch {
+                            syncing = true
+                            val config = authStore.configFlow.first() ?: run {
+                                syncing = false
+                                return@launch
+                            }
+                            val client = CompanionClient(config.baseUrl, config.bearerToken)
+                            val syncResult = runCatching {
+                                client.syncProjectToMac(SyncProjectRequest(encodedProject = encoded))
+                            }
+                            syncing = false
+                            syncResult.onSuccess {
+                                // Sync done — retry the original launch
+                                // immediately so the user doesn't have
+                                // to hunt for the Launch button again.
+                                notMirroredFor = null
+                                error = null
+                                launching = true
+                                val retry = runCatching {
+                                    val resp = client.launchHostSession(
+                                        LaunchHostSessionRequest(
+                                            host = selectedHost.key,
+                                            account = selectedAccount.key,
+                                            projectPath = proj.actualPath,
+                                            projectDisplayName = proj.displayName,
+                                        )
+                                    )
+                                    CreateWindowResponse(
+                                        windowIndex = resp.windowIndex,
+                                        paneId = resp.paneId,
+                                    )
+                                }
+                                client.close()
+                                launching = false
+                                retry.onSuccess { response ->
+                                    onLaunched(response)
+                                    onDismiss()
+                                }.onFailure { t ->
+                                    error = "Launch still failed after sync: " +
+                                        extractErrorBody(t)
+                                }
+                            }.onFailure { t ->
+                                client.close()
+                                error = "Sync failed: " + extractErrorBody(t)
+                            }
+                        }
+                    },
+                    enabled = !syncing && !launching,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (syncing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text("Syncing to Mac…")
+                    } else {
+                        Text("Sync now and retry")
+                    }
+                }
+            }
+
             Button(
                 onClick = {
                     val proj = selectedProject ?: return@Button
+                    notMirroredFor = null
+                    error = null
                     scope.launch {
                         launching = true
                         val config = authStore.configFlow.first() ?: run {
@@ -207,14 +364,34 @@ fun CreateWindowSheet(
                         }
                         val client = CompanionClient(config.baseUrl, config.bearerToken)
                         val result = runCatching {
-                            client.createWindow(
-                                CreateWindowRequest(
-                                    sessionName = defaultSessionName,
-                                    projectPath = proj.actualPath,
-                                    projectDisplayName = proj.displayName,
-                                    account = selectedAccount.key,
+                            if (selectedHost.key == "local") {
+                                client.createWindow(
+                                    CreateWindowRequest(
+                                        sessionName = defaultSessionName,
+                                        projectPath = proj.actualPath,
+                                        projectDisplayName = proj.displayName,
+                                        account = selectedAccount.key,
+                                    )
                                 )
-                            )
+                            } else {
+                                // Remote host: different endpoint, same
+                                // response shape for `onLaunched`. The
+                                // CreateWindowResponse mapping drops
+                                // `session_name` since callers only need
+                                // the pane_id to deep-link.
+                                val resp = client.launchHostSession(
+                                    LaunchHostSessionRequest(
+                                        host = selectedHost.key,
+                                        account = selectedAccount.key,
+                                        projectPath = proj.actualPath,
+                                        projectDisplayName = proj.displayName,
+                                    )
+                                )
+                                CreateWindowResponse(
+                                    windowIndex = resp.windowIndex,
+                                    paneId = resp.paneId,
+                                )
+                            }
                         }
                         client.close()
                         launching = false
@@ -222,7 +399,17 @@ fun CreateWindowSheet(
                             onLaunched(response)
                             onDismiss()
                         }.onFailure { t ->
-                            error = "Launch failed: ${t.message ?: t::class.simpleName}"
+                            val body = extractErrorBody(t)
+                            // Detect the pre-flight "project not
+                            // mirrored" case so we can offer a
+                            // one-click Sync+Retry instead of making
+                            // the user bounce to the desktop.
+                            if (body.contains("not mirrored", ignoreCase = true) && selectedHost.key != "local") {
+                                notMirroredFor = proj.encodedName
+                                error = body
+                            } else {
+                                error = "Launch failed: $body"
+                            }
                         }
                     }
                 },
