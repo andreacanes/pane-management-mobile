@@ -441,4 +441,17 @@ sealed class EventDto {
     @Serializable
     @SerialName("session_ended")
     data class SessionEnded(val name: String, val at: Long) : EventDto()
+
+    /** Host-aware window-focus change. Emitted within ~1 s of the
+     *  user switching tmux windows on the host. The desktop uses
+     *  this for fast auto-follow; the APK can ignore it safely (no
+     *  concept of a "currently attached window" on the phone). */
+    @Serializable
+    @SerialName("window_focus_changed")
+    data class WindowFocusChanged(
+        val host: String,
+        @SerialName("session_name") val sessionName: String,
+        @SerialName("window_index") val windowIndex: Int,
+        val at: Long,
+    ) : EventDto()
 }
